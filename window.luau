@@ -24,6 +24,162 @@ end
 
 local polling = false
 
+local BRIDGE_KEY = "tern_ed25519"
+
+local Bridge = {}
+
+function Bridge.alias_name(ws: string): string
+	return "tern-" .. (string.match(ws, "[^/]+$") or "dev")
+end
+
+function Bridge.alias_exists(ws: string): boolean
+	local home = tern.getenv("HOME") or ""
+	local cfg = home .. "/.ssh/config"
+	if not tern.fs.exists(cfg) then
+		return false
+	end
+	local ok, text = pcall(tern.fs.read, cfg)
+	if not ok then
+		return false
+	end
+	return string.find(text, "Host " .. Bridge.alias_name(ws) .. "\n", 1, true) ~= nil
+end
+
+local function read_or_create_keypair(cb: (boolean) -> ())
+	local priv = tern.plugin.data .. "/" .. BRIDGE_KEY
+	if tern.fs.exists(priv) then
+		cb(true)
+		return
+	end
+	tern.process.run({ "ssh-keygen", "-t", "ed25519", "-N", "", "-q", "-f", priv }, {}, function(r)
+		cb(r.status == 0)
+	end)
+end
+
+local function ensure_sshd(engine: string, container: string, cb: (boolean) -> ())
+	local script = "which sshd >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq openssh-server); mkdir -p /run/sshd"
+	tern.process.run({ engine, "exec", "--user", "root", container, "sh", "-c", script }, {}, function(r)
+		cb(r.status == 0)
+	end)
+end
+
+local function ensure_authorized_keys(engine: string, container: string, cb: (boolean) -> ())
+	local ok, pub = pcall(tern.fs.read, tern.plugin.data .. "/" .. BRIDGE_KEY .. ".pub")
+	if not ok then
+		cb(false)
+		return
+	end
+	pub = string.gsub(pub, "%s+$", "")
+	local q = Resolve.shell_quote(pub)
+	local script = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && (grep -qxF "
+		.. q
+		.. " ~/.ssh/authorized_keys || echo "
+		.. q
+		.. " >> ~/.ssh/authorized_keys)"
+	tern.process.run({ engine, "exec", container, "sh", "-c", script }, {}, function(r)
+		cb(r.status == 0)
+	end)
+end
+
+function Bridge.write_alias(ws: string, container: string, user: string?, engine: string): boolean
+	local home = tern.getenv("HOME") or ""
+	local sshdir = home .. "/.ssh"
+	local cfg = sshdir .. "/config"
+	local alias = Bridge.alias_name(ws)
+	local begin = "# >>> tern-devcontainers " .. alias .. " >>>"
+	local finish = "# <<< tern-devcontainers " .. alias .. " <<<"
+	local lines = {
+		begin,
+		"Host " .. alias,
+		"  HostName " .. container,
+	}
+	if user ~= nil and user ~= "" then
+		table.insert(lines, "  User " .. user)
+	end
+	table.insert(lines, "  IdentityFile " .. tern.plugin.data .. "/" .. BRIDGE_KEY)
+	table.insert(lines, "  IdentitiesOnly yes")
+	table.insert(lines, "  UserKnownHostsFile " .. tern.plugin.data .. "/known_hosts")
+	table.insert(lines, "  StrictHostKeyChecking accept-new")
+	table.insert(lines, "  ProxyCommand " .. engine .. " exec -i --user root " .. container .. " /usr/sbin/sshd -i")
+	table.insert(lines, finish)
+	local block = table.concat(lines, "\n")
+	local text = ""
+	if tern.fs.exists(cfg) then
+		local ok, t = pcall(tern.fs.read, cfg)
+		if not ok then
+			return false
+		end
+		text = t
+	end
+	local s, e = string.find(text, begin .. ".-" .. finish)
+	if s ~= nil then
+		text = string.sub(text, 1, s - 1) .. block .. string.sub(text, e + 1)
+	else
+		if text ~= "" and string.sub(text, -1) ~= "\n" then
+			text = text .. "\n"
+		end
+		text = text .. block .. "\n"
+	end
+	local okw = pcall(function()
+		tern.fs.mkdir(sshdir)
+		tern.fs.write(cfg, text)
+	end)
+	return okw
+end
+
+function Bridge.provision(cx: any, ws: string, container: string, engine: string, cb: (boolean) -> ())
+	read_or_create_keypair(function(ok1)
+		if not ok1 then
+			cx:toast("error", "ssh-keygen is missing or failed")
+			cb(false)
+			return
+		end
+		ensure_sshd(engine, container, function(ok2)
+			if not ok2 then
+				cx:toast("error", "Could not install openssh-server in the container (Debian/Ubuntu images only in v1)")
+				cb(false)
+				return
+			end
+			ensure_authorized_keys(engine, container, function(ok3)
+				if not ok3 then
+					cx:toast("error", "Could not write authorized_keys in the container")
+					cb(false)
+					return
+				end
+				if not Bridge.write_alias(ws, container, Resolve.read_remote_user(ws), engine) then
+					cx:toast("error", "Could not write the SSH config alias")
+					cb(false)
+					return
+				end
+				cb(true)
+			end)
+		end)
+	end)
+end
+
+post_rebuild = function(cx: any, ws: string)
+	if not Bridge.alias_exists(ws) then
+		cx:toast("info", "Container rebuilt — run 'Attach Tern to Container' for native reconnection", ws)
+		return
+	end
+	Resolve.detect_engine(function(engine)
+		if engine == nil then
+			return
+		end
+		Resolve.container_for_host(engine, ws, function(container)
+			if container == nil then
+				return
+			end
+			Bridge.provision(cx, ws, container, engine, function(ok)
+				if ok then
+					cx:toast("success", "Bridge ready — Tern is reconnecting to the container", container)
+					cx:command("new_session_on_host")
+				end
+			end)
+		end)
+	end)
+end
+
 local function poll(cx: any)
 	for pane, entry in pending do
 		local ok, text = pcall(tern.fs.read, entry.marker)
