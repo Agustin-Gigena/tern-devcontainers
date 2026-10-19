@@ -27,7 +27,10 @@ Window-half commands (`tern.command`), palette group "Dev Containers":
 | `rebuild_no_cache_reopen` | Dev Containers: Rebuild Without Cache and Reopen in Container | same | same |
 
 `available` budget is 4 ms: only cheap `tern.fs.exists` calls, never process
-spawns. Container membership is confirmed at execution time, not in `available`.
+spawns. The walk-up is memoized in `tern.kv` keyed by `cwd` (shared
+`kv.json`, re-read on mtime change) so repeated palette opens do one lookup;
+a miss recomputes the walk once. Container membership is confirmed at
+execution time, not in `available`.
 
 ## Architecture
 
@@ -71,24 +74,36 @@ devcontainer up --workspace-folder <host_path> --remove-existing-container \
 ```
 
 - Opened with `cx.layout:new_tab({ cwd = host_path, command = ... })` so build
-  logs stream live, as in VSCode.
+  logs stream live, as in VSCode. The command line ends with
+  `; echo $? > <data>/rebuild-<n>.status` (marker file in the plugin's data
+  directory).
 - Compose files, features, `initializeCommand`, `postCreateCommand` and
   `remoteUser` are handled by the CLI itself; the plugin adds no logic of its
   own.
-- The pane is tracked in `pending[pane] = { ws = host_path }`.
+- The pane and its marker path are tracked in `pending[pane] = { ws =
+  host_path, marker = ... }`.
 - Duplicate guard: a live `pending` entry for the same `host_path` toasts
   "Rebuild already running" and does not start another.
 
-Completion — window event `pane_exited` on a tracked pane:
+Completion — window-half `tern.timer` poll (re-armed every 500 ms while
+`pending` is non-empty; timer callbacks receive a fresh `cx`):
 
+- Marker file appears → read the exit status, remove the marker and the
+  `pending` entry, stop polling.
 - Status 0 → `cx.layout:split(rebuild_pane, "right", { cwd = host_path,
   command = "devcontainer exec --workspace-folder <host_path> bash" })`, toast
   success. The new pane takes focus; user lands inside the fresh container,
   matching VSCode's automatic reopen/reconnect.
 - Status ≠ 0 → toast error with exit code; the log pane stays open.
 
+This mechanism is chosen over window events because `pane_exited` is host-only
+(events reference) and `command_started`/`command_finished` require a shell
+that reports command lines (shell integration), which the docs do not
+guarantee for a pane launched with `launch.command`. Marker + timer uses only
+guaranteed APIs (`tern.timer`, `tern.fs`, fresh `cx` in window timers).
+
 Old panes whose shells lived in the removed container die on their own
-(VSCode closes its terminals too); the plugin ignores their `pane_exited`
+(VSCode closes its terminals too); the plugin ignores their `pane_closed`
 events.
 
 ## Error handling
@@ -100,7 +115,7 @@ events.
 | cwd unknown (`""`) | `available` hides all four rows |
 | Repo uses root `.devcontainer.json` | Walk-up checks both locations (spec default) |
 | Alternative config subfolders of `.devcontainer/` | Out of scope for v1 (no picker, as VSCode has) |
-| Tern reload mid-rebuild | Rebuild continues (it is the shell's process); automatic re-entry is lost — log pane shows the final status for a manual exec |
+| Tern reload mid-rebuild | Rebuild continues (it is the shell's process); timers die with the VM, so automatic re-entry is lost — log pane shows the final status for a manual exec; stale markers are overwritten (unique id per rebuild) |
 | iOS client / web tab | No Lua there; plugin requires Tern desktop with local session daemon (documented in README) |
 
 ## Installation
