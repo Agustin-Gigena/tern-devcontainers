@@ -41,7 +41,7 @@ lenses, no styles.
 ```text
 Tern-DevContainers/
   plugin.toml
-  window.luau      # commands, pane_exited handler, engine detection
+  window.luau      # commands, completion timer + marker handling, engine detection
   lib/
     resolve.luau   # find_devcontainer_config(), resolve_container_host_path()
   README.md
