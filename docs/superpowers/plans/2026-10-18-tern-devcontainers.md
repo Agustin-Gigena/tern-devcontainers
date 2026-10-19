@@ -1,34 +1,35 @@
-# Tern DevContainers Implementation Plan
+# Tern DevContainers Implementation Plan (v2)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A Tern window-half plugin `devcontainers` that replicates the four rebuild commands of the official VSCode Dev Containers extension, verbatim in name and behavior, for docker and podman.
+**Goal:** Tern plugin `devcontainers` — the Tern session daemon runs inside the dev container as a native remote host (VSCode's architecture: server injected, lifecycle managed, silent reconnect after rebuild), plus the four VSCode-parity rebuild commands.
 
-**Architecture:** Window-half only (`plugin.toml` + `window.luau` + `lib/resolve.luau`). Commands open a dedicated pane streaming `devcontainer up` logs; completion is detected by a status marker file polled with `tern.timer`; on success a second pane runs `devcontainer exec` inside the fresh container. Spec: `docs/superpowers/specs/2026-10-18-tern-devcontainers-design.md` (validated against official VSCode extension v0.470.0, devcontainers/cli source, and full Tern SDK docs).
+**Architecture:** Window-half only. Rebuild commands stream `devcontainer up` logs in a dedicated pane and detect completion via a status marker polled with `tern.timer`. An SSH bridge (per-connection `sshd -i` over `engine exec` ProxyCommand, managed `~/.ssh/config` alias, dedicated keypair) lets Tern's native SSH flow install its daemon inside the container; the alias targets the container by name so Tern's native reconnect survives rebuilds.
 
-**Tech Stack:** Tern Plugin SDK (Luau, schema 1 manifest), `devcontainer` CLI, docker/podman CLI for inspect, `tern plugin link` for development.
+**Tech Stack:** Tern Plugin SDK (Luau, schema 1), `devcontainer` CLI, docker/podman CLI (inspect/exec), OpenSSH (`ssh-keygen`, `ssh`), `tern plugin link`.
 
 ## Global Constraints
 
-- Manifest keys exactly: `schema = 1`, `id = "devcontainers"`, `name = "Dev Containers"`, `version`, `description`, `icon`, `window = "window.luau"` — no other keys, no `host`, no `[[blocks]]`, no `[[lenses]]` (unknown keys are errors; `blocks`/`lenses` need a host entry).
-- Command ids: `rebuild`, `rebuild_no_cache`, `rebuild_reopen`, `rebuild_no_cache_reopen`; palette group `Dev Containers`; titles exactly `Rebuild Container`, `Rebuild Container Without Cache`, `Rebuild and Reopen in Container`, `Rebuild Without Cache and Reopen in Container`.
-- Rebuild command line always: `devcontainer up --workspace-folder <host_path> --remove-existing-container` plus ` --build-no-cache` only for the two NoCache commands; appended `; echo $? > <marker>`.
-- `available` budget 4 ms: focused-pane cwd lookup plus at most one `tern.fs.exists`; no directory walk-up (config discovery happens in `run`, where its cost is irrelevant — VSCode parity: "fuera" rows show for any host folder).
-- `run` budget 50 ms: never block; all engine/inspect work goes through `tern.process.run` callbacks (fresh `cx`).
-- Rebuild CLI is broken on this host (`node: libsimdjson.so.33` missing) — end-to-end verification of Tasks 5–6 requires fixing it first (`npm i -g @devcontainers/cli`).
-- No local `luau` binary exists: per-task verification is `tern plugin list` (status Ready; Failed shows the exact load error) plus GUI palette checks.
+- Manifest keys exactly: `schema = 1`, `id = "devcontainers"`, `name = "Dev Containers"`, `version`, `description`, `icon`, `window = "window.luau"` — nothing else (unknown keys are errors).
+- Rebuild command ids/titles/gating match the official extension v0.470.0 exactly (see spec's Commands table). Additional bridge commands: `attach`, `reconnect`.
+- Rebuild line: `devcontainer up --workspace-folder <host_path> --remove-existing-container [--build-no-cache]; echo $? > <marker>`.
+- `available` (4 ms): focused-pane cwd lookup + at most one `tern.fs.exists`; no walk-up, no processes.
+- `run` (50 ms) and timer callbacks (50 ms): never block; everything slow goes through `tern.process.run` callbacks (fresh `cx` in window half).
+- Completion detection is marker-file + `tern.timer` polling — never window `pane_exited` (host-only) or `command_finished` (needs shell integration).
+- Re-provision after rebuild mirrors VSCode reinstalling vscode-server: fresh containers lose sshd, so the bridge re-installs it silently when the alias block already exists (project was attached before).
+- No local `luau` binary: per-task verification is `tern plugin list` (status Ready; Failed prints the load error) plus GUI checks.
+- Host `devcontainer` CLI currently broken (`libsimdjson.so.33`) — fix (`npm i -g @devcontainers/cli`) before Task 8's end-to-end.
 
 ---
 
-### Task 1: Scaffold the plugin package and link it for development
+### Task 1: Scaffold the plugin package and link it
 
 **Files:**
 - Create: `plugin.toml`
 - Create: `window.luau`
 
 **Interfaces:**
-- Consumes: nothing.
-- Produces: package `devcontainers` loading Ready; `window.luau` entry that later tasks extend (each keeps the `--!strict` header and `local Resolve = require("./lib/resolve")` import added in Task 2).
+- Produces: package `devcontainers` loading Ready; `window.luau` entry extended by later tasks (keeps the `--!strict` header and `local Resolve = require("./lib/resolve")`).
 
 - [ ] **Step 1: Write `plugin.toml`**
 
@@ -36,8 +37,8 @@
 schema = 1
 id = "devcontainers"
 name = "Dev Containers"
-version = "0.1.0"
-description = "VSCode-parity devcontainer rebuild commands."
+version = "0.2.0"
+description = "Dev containers as native Tern hosts: VSCode-parity rebuilds and native reconnection."
 icon = "box"
 window = "window.luau"
 ```
@@ -46,20 +47,16 @@ window = "window.luau"
 
 ```lua
 --!strict
--- Dev Containers: VSCode-parity rebuild commands for Tern.
+-- Dev Containers: native Tern hosts for dev containers.
+local Resolve = require("./lib/resolve")
 ```
 
-- [ ] **Step 3: Link the package for development**
+- [ ] **Step 3: Link and verify**
 
-Run: `tern plugin link /hdd/Linux/agigena/Repositorios/Tern-DevContainers`
-Expected: prints the plugins folder link (`<config>/plugins/devcontainers.path`).
+Run: `tern plugin link /hdd/Linux/agigena/Repositorios/Tern-DevContainers && tern plugin list`
+Expected: `linked devcontainers 0.2.0 → …` then `devcontainers 0.2.0 Dev Containers … ready`.
 
-- [ ] **Step 4: Verify the plugin loads**
-
-Run: `tern plugin list`
-Expected: `devcontainers` listed with status `Ready`. If `Failed`, the listed problem text names the exact manifest/entry error — fix and re-run.
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add plugin.toml window.luau
@@ -70,14 +67,13 @@ git commit -m "feat: scaffold devcontainers plugin package"
 
 **Files:**
 - Create: `lib/resolve.luau`
-- Modify: `window.luau` (add the import line)
 
 **Interfaces:**
-- Consumes: `tern.fs.exists(path) -> boolean` (never raises), `tern.plugin.data` (string).
-- Produces (later tasks rely on exact signatures):
-  - `Resolve.parent_of(path: string): string?` — parent directory, `nil` at filesystem root.
-  - `Resolve.find_config(dir: string): string?` — nearest ancestor (≤16 levels) containing `.devcontainer/devcontainer.json` or `.devcontainer.json`, else `nil`.
-  - `Resolve.shell_quote(s: string): string` — POSIX single-quoted argument.
+- Consumes: `tern.fs.exists(path) -> boolean` (never raises).
+- Produces:
+  - `Resolve.parent_of(path: string): string?`
+  - `Resolve.find_config(dir: string): string?` — nearest ancestor (≤16 levels) holding `.devcontainer/devcontainer.json` or `.devcontainer.json`.
+  - `Resolve.shell_quote(s: string): string` — POSIX single-quote escaping.
 
 - [ ] **Step 1: Write `lib/resolve.luau`**
 
@@ -115,41 +111,33 @@ end
 return Resolve
 ```
 
-- [ ] **Step 2: Import it in `window.luau`**
-
-Replace the whole content of `window.luau` with:
-
-```lua
---!strict
--- Dev Containers: VSCode-parity rebuild commands for Tern.
-local Resolve = require("./lib/resolve")
-```
-
-- [ ] **Step 3: Verify the package still loads (module syntax + require path)**
+- [ ] **Step 2: Verify load**
 
 Run: `tern plugin list`
-Expected: `devcontainers` → `Ready`. `Failed` with `module 'lib/resolve' not found`-style text means the require path or file name is wrong.
+Expected: `devcontainers … ready`. `Failed` naming `lib/resolve` means wrong require path or file name.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
-git add lib/resolve.luau window.luau
+git add lib/resolve.luau
 git commit -m "feat: config discovery and shell helpers"
 ```
 
-### Task 3: Engine detection and container→host path mapping
+### Task 3: Engine detection, container mapping, remoteUser parsing
 
 **Files:**
-- Modify: `lib/resolve.luau` (append the two functions before `return Resolve`)
+- Modify: `lib/resolve.luau` (append before `return Resolve`)
 
 **Interfaces:**
-- Consumes: `tern.process.run(argv, opts?, callback)` — raises at call when the program is missing (hence `pcall`); callback `fn(result, cx?)` with `result.status`, `result.stdout`; `tern.json.decode(text)` raises on bad JSON.
+- Consumes: `tern.process.run` (raises at call when the binary is missing → `pcall`), `tern.json.decode` (raises on bad JSON → `pcall`), `tern.fs.read`.
 - Produces:
   - `export type Engine = "docker" | "podman"`
-  - `Resolve.detect_engine(callback: (Engine?) -> ())` — tries `docker`, falls back to `podman`; `nil` when neither works.
-  - `Resolve.container_host_path(engine: Engine, container_cwd: string, callback: (string?) -> ())` — host-side path of the bind mount covering `container_cwd` (longest matching `Destination` wins), or `nil`.
+  - `Resolve.detect_engine(callback: (Engine?) -> ())`
+  - `Resolve.container_info(engine: Engine, container_cwd: string, callback: ({ ws: string, container: string }?) -> ())` — longest bind `Destination` covering `container_cwd`; `ws = Source + suffix`, `container` = container name (`.Name` minus leading `/`).
+  - `Resolve.container_for_host(engine: Engine, host_path: string, callback: (string?) -> ())` — name of a running container with a bind `Source` covering `host_path` (used after a "fuera" rebuild, where the container cwd is unknown).
+  - `Resolve.read_remote_user(config_dir: string): string?` — `remoteUser` from the JSONC `devcontainer.json` (comments stripped naively; any failure → `nil`).
 
-- [ ] **Step 1: Append engine detection and mount mapping to `lib/resolve.luau`**
+- [ ] **Step 1: Append the functions**
 
 Insert before the final `return Resolve`:
 
@@ -177,11 +165,12 @@ function Resolve.detect_engine(callback: (Engine?) -> ())
 	end)
 end
 
-function Resolve.container_host_path(
-	engine: Engine,
-	container_cwd: string,
-	callback: (string?) -> ()
-)
+local function name_of(c: any): string
+	local n = tostring(c.Name or "")
+	return string.gsub(n, "^/", "")
+end
+
+local function inspect_all(engine: Engine, callback: (any?) -> ())
 	tern.process.run({ engine, "ps", "-q" }, {}, function(result)
 		if result.status ~= 0 then
 			callback(nil)
@@ -201,64 +190,116 @@ function Resolve.container_host_path(
 				return
 			end
 			local ok, containers = pcall(tern.json.decode, r2.stdout)
-			if not ok or type(containers) ~= "table" then
+			if not ok then
 				callback(nil)
 				return
 			end
-			local best: string? = nil
-			local best_len = -1
-			for _, container in containers do
-				for _, mount in (container.Mounts or {}) do
-					if mount.Type == "bind" and mount.Source ~= nil and mount.Destination ~= nil then
-						local dest: string = mount.Destination
-						local covers = container_cwd == dest
-							or (
-								string.sub(container_cwd, 1, #dest) == dest
-								and string.sub(container_cwd, #dest + 1, #dest + 1) == "/"
-							)
-						if covers and #dest > best_len then
-							best_len = #dest
-							best = mount.Source .. string.sub(container_cwd, #dest + 1)
-						end
-					end
-				end
-			end
-			callback(best)
+			callback(containers)
 		end)
 	end)
 end
+
+local function covers(path: string, base: string): boolean
+	if path == base then
+		return true
+	end
+	return string.sub(path, 1, #base) == base
+		and string.sub(path, #base + 1, #base + 1) == "/"
+end
+
+function Resolve.container_info(
+	engine: Engine,
+	container_cwd: string,
+	callback: ({ ws: string, container: string }?) -> ()
+)
+	inspect_all(engine, function(containers)
+		local best: { ws: string, container: string }? = nil
+		local best_len = -1
+		for _, c in (containers or {}) do
+			for _, m in (c.Mounts or {}) do
+				if m.Type == "bind" and m.Source ~= nil and m.Destination ~= nil then
+					local dest: string = m.Destination
+					if covers(container_cwd, dest) and #dest > best_len then
+						best_len = #dest
+						best = {
+							ws = m.Source .. string.sub(container_cwd, #dest + 1),
+							container = name_of(c),
+						}
+					end
+				end
+			end
+		end
+		callback(best)
+	end)
+end
+
+function Resolve.container_for_host(engine: Engine, host_path: string, callback: (string?) -> ())
+	inspect_all(engine, function(containers)
+		local best_name: string? = nil
+		local best_len = -1
+		for _, c in (containers or {}) do
+			for _, m in (c.Mounts or {}) do
+				if m.Type == "bind" and m.Source ~= nil and m.Destination ~= nil then
+					local src: string = m.Source
+					if covers(host_path, src) and #src > best_len then
+						best_len = #src
+						best_name = name_of(c)
+					end
+				end
+			end
+		end
+		callback(best_name)
+	end)
+end
+
+function Resolve.read_remote_user(config_dir: string): string?
+	for _, name in { "/.devcontainer/devcontainer.json", "/.devcontainer.json" } do
+		local path = config_dir .. name
+		if tern.fs.exists(path) then
+			local ok, text = pcall(tern.fs.read, path)
+			if not ok then
+				return nil
+			end
+			local stripped = string.gsub(text, "/%*.-%*/", "")
+			stripped = string.gsub(stripped, "//[^\n]*", "")
+			local ok2, doc = pcall(tern.json.decode, stripped)
+			if ok2 and type(doc) == "table" and type(doc.remoteUser) == "string" then
+				return doc.remoteUser
+			end
+			return nil
+		end
+	end
+	return nil
+end
 ```
 
-- [ ] **Step 2: Verify the package still loads**
+- [ ] **Step 2: Verify load**
 
 Run: `tern plugin list`
-Expected: `devcontainers` → `Ready` (a Luau syntax error surfaces as `Failed` with the problem text).
+Expected: `devcontainers … ready`.
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add lib/resolve.luau
-git commit -m "feat: docker/podman engine detection and bind-mount host path mapping"
+git commit -m "feat: engine detection, bind-mount container mapping, remoteUser parsing"
 ```
 
-### Task 4: The four commands with VSCode-parity gating and rebuild launch
+### Task 4: The four rebuild commands with VSCode-parity gating
 
 **Files:**
-- Modify: `window.luau` (full content below)
+- Modify: `window.luau` (add everything below; keep the require line)
 
 **Interfaces:**
-- Consumes: `Resolve.find_config`, `Resolve.shell_quote`, `Resolve.detect_engine`, `Resolve.container_host_path`, `tern.plugin.data`.
+- Consumes: `Resolve.find_config`, `Resolve.shell_quote`, `Resolve.detect_engine`, `Resolve.container_info`.
 - Produces:
   - Palette commands `plugin.devcontainers.rebuild`, `.rebuild_no_cache`, `.rebuild_reopen`, `.rebuild_no_cache_reopen` (group `Dev Containers`).
-  - `start_rebuild(cx, ws: string, no_cache: boolean)` — shared launcher with duplicate guard; stores `pending[pane] = { ws = ws, marker = marker }`; Task 5 consumes `pending`.
+  - `pending: { [number]: { ws: string, marker: string } }` and `start_rebuild(cx, ws, no_cache)` — Task 5 consumes them.
+  - `focused_cwd(cx)` and `rebuild_dentro/rebuild_fuera(cx, no_cache)` helpers.
 
-- [ ] **Step 1: Replace `window.luau` with the full implementation**
+- [ ] **Step 1: Add state and helpers to `window.luau`**
 
 ```lua
---!strict
--- Dev Containers: VSCode-parity rebuild commands for Tern.
-local Resolve = require("./lib/resolve")
-
 local counter = 0
 local pending: { [number]: { ws: string, marker: string } } = {}
 
@@ -316,12 +357,12 @@ local function rebuild_dentro(cx: any, no_cache: boolean)
 			cx:toast("error", "Neither docker nor podman is available")
 			return
 		end
-		Resolve.container_host_path(engine, cwd, function(ws)
-			if ws == nil then
+		Resolve.container_info(engine, cwd, function(info)
+			if info == nil then
 				cx:toast("error", "Focused pane is not inside a bind mount of a running container", cwd)
 				return
 			end
-			start_rebuild(cx, ws, no_cache)
+			start_rebuild(cx, info.ws, no_cache)
 		end)
 	end)
 end
@@ -339,7 +380,11 @@ local function rebuild_fuera(cx: any, no_cache: boolean)
 	end
 	start_rebuild(cx, ws, no_cache)
 end
+```
 
+- [ ] **Step 2: Register the four commands**
+
+```lua
 local function inside_gate(cx: any): boolean
 	local cwd = focused_cwd(cx)
 	return cwd ~= nil and not tern.fs.exists(cwd)
@@ -396,35 +441,44 @@ tern.command({
 })
 ```
 
-- [ ] **Step 2: Verify load and status**
+- [ ] **Step 3: Verify load**
 
 Run: `tern plugin list`
-Expected: `devcontainers` → `Ready` (a bad command id such as `bind`, or a manifest mismatch, fails load with the exact problem).
+Expected: `devcontainers … ready`.
 
-- [ ] **Step 3: GUI palette checks (Tern desktop)**
+- [ ] **Step 4: GUI palette checks**
 
-1. Focus a pane inside a repo with `.devcontainer/` (host side): palette shows only `Rebuild and Reopen in Container` and `Rebuild Without Cache and Reopen in Container`.
-2. Focus a pane inside the dev container (`/Contagiar`-style path): palette shows only `Rebuild Container` and `Rebuild Container Without Cache`.
-3. Focus a pane in `~` or `/tmp`: only the two "fuera" rows appear (VSCode parity: `workspaceFolderCount != 0` with any folder); running one toasts `No devcontainer config found in parent directories` and opens no pane.
-Expected: exactly the rows of the VSCode `when` matrix.
+1. Host pane in a repo with `.devcontainer/`: only the two "fuera" rows show.
+2. Pane inside the container (`/Contagiar`-style path): only the two "dentro" rows show.
+3. Pane in `~` or `/tmp`: only the two "fuera" rows show (VSCode parity: any open folder); running one toasts `No devcontainer config found in parent directories` and opens no pane.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add window.luau
-git commit -m "feat: four VSCode-parity rebuild commands with gating and rebuild launch"
+git commit -m "feat: four VSCode-parity rebuild commands"
 ```
 
-### Task 5: Completion marker polling, automatic re-entry, stale-marker cleanup
+### Task 5: Completion marker polling and post-rebuild bridge re-provision
 
 **Files:**
-- Modify: `window.luau` (add the pieces below; insertion points noted)
+- Modify: `window.luau` (add polling; wire into `start_rebuild`)
 
 **Interfaces:**
-- Consumes: `pending` (Task 4), `Resolve.shell_quote`, `tern.timer(ms, fn)` (window callbacks get fresh `cx`), `tern.fs.read/remove/list` (in `pcall`).
-- Produces: automatic `devcontainer exec` pane after a successful rebuild; error toast with exit status otherwise; `rebuild-<n>.status` files cleaned on `window_start`.
+- Consumes: `pending`, `tern.timer` (fresh `cx`), `tern.fs.read/remove` in `pcall`, `tern.fs.list`.
+- Produces:
+  - `post_rebuild(cx, ws: string)` — if the project's alias block exists in `~/.ssh/config` (attached before), silently re-provisions the bridge in the fresh container; otherwise toasts the attach hint. Task 6 supplies `Bridge.provision` and `Bridge.alias_exists`.
+  - Poll loop: 500 ms re-arming timer; success → toast + `post_rebuild`; failure → toast with exit status.
 
-- [ ] **Step 1: Add the polling machinery after `pending` declaration**
+- [ ] **Step 1: Add a temporary `post_rebuild` (declared BEFORE the poll so `poll` captures the local, not a global)**
+
+```lua
+local function post_rebuild(cx: any, _ws: string)
+	cx:toast("info", "Container rebuilt — run 'Attach Tern to Container' to enable native reconnection")
+end
+```
+
+- [ ] **Step 2: Add the polling machinery after it**
 
 ```lua
 local polling = false
@@ -437,14 +491,8 @@ local function poll(cx: any)
 			pending[pane] = nil
 			pcall(tern.fs.remove, entry.marker)
 			if status == 0 then
-				local exec = "devcontainer exec --workspace-folder "
-					.. Resolve.shell_quote(entry.ws)
-					.. " bash"
-				local newpane = cx.layout:split(pane, "right", { cwd = entry.ws, command = exec })
-				if newpane == nil then
-					cx.layout:new_tab({ cwd = entry.ws, command = exec })
-				end
 				cx:toast("success", "Rebuilt", entry.ws)
+				post_rebuild(cx, entry.ws)
 			else
 				cx:toast("error", "Rebuild failed (exit " .. status .. ")", entry.ws)
 			end
@@ -466,15 +514,9 @@ local function start_polling()
 end
 ```
 
-- [ ] **Step 2: Start polling from `start_rebuild`**
+In `start_rebuild`, after `pending[pane] = { ws = ws, marker = marker }` add `start_polling()`.
 
-In `start_rebuild`, after `pending[pane] = { ws = ws, marker = marker }` add:
-
-```lua
-	start_polling()
-```
-
-- [ ] **Step 3: Clean stale markers on window start (end of `window.luau`)**
+- [ ] **Step 3: Clean stale markers on window start (end of file)**
 
 ```lua
 tern.on("window_start", function(_cx)
@@ -489,22 +531,290 @@ end)
 - [ ] **Step 4: Verify load**
 
 Run: `tern plugin list`
-Expected: `devcontainers` → `Ready`.
+Expected: `devcontainers … ready`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add window.luau
-git commit -m "feat: marker-poll completion, automatic exec re-entry, stale marker cleanup"
+git commit -m "feat: marker-poll completion with post-rebuild hook and stale cleanup"
 ```
 
-### Task 6: README and end-to-end verification matrix
+### Task 6: SSH bridge — keypair, sshd, authorized_keys, managed alias, re-provision
+
+**Files:**
+- Modify: `window.luau` (add a `Bridge` section above `poll`; replace Task 5 Step 2's `post_rebuild` with the real one)
+
+**Interfaces:**
+- Consumes: `tern.process.run`, `tern.fs` (read/write/exists/mkdir in `pcall` where they can fail), `tern.getenv("HOME")`, `Resolve.read_remote_user`, `Resolve.container_for_host`, `Resolve.detect_engine`, `Resolve.shell_quote`.
+- Produces:
+  - `Bridge.alias_name(ws: string): string` — `tern-<basename>`.
+  - `Bridge.alias_exists(ws: string): boolean`.
+  - `Bridge.write_alias(ws: string, container: string, user: string?, engine: string)` — idempotent managed block between `# >>> tern-devcontainers <alias> >>>` / `<<<` markers.
+  - `Bridge.provision(cx, ws: string, container: string, engine: string, cb: (boolean) -> ())` — keypair → sshd ensure → authorized_keys → alias; toasts concrete failures.
+  - `post_rebuild(cx, ws: string)` (final) — `alias_exists` → detect engine → `container_for_host` → `provision` silently; else attach hint.
+
+- [ ] **Step 1: Add the Bridge section above `poll`**
+
+```lua
+local BRIDGE_KEY = "tern_ed25519"
+
+local Bridge = {}
+
+function Bridge.alias_name(ws: string): string
+	return "tern-" .. (string.match(ws, "[^/]+$") or "dev")
+end
+
+function Bridge.alias_exists(ws: string): boolean
+	local home = tern.getenv("HOME") or ""
+	local cfg = home .. "/.ssh/config"
+	if not tern.fs.exists(cfg) then
+		return false
+	end
+	local ok, text = pcall(tern.fs.read, cfg)
+	if not ok then
+		return false
+	end
+	return string.find(text, "Host " .. Bridge.alias_name(ws) .. "\n", 1, true) ~= nil
+end
+
+local function read_or_create_keypair(cb: (boolean) -> ())
+	local priv = tern.plugin.data .. "/" .. BRIDGE_KEY
+	if tern.fs.exists(priv) then
+		cb(true)
+		return
+	end
+	tern.process.run({ "ssh-keygen", "-t", "ed25519", "-N", "", "-q", "-f", priv }, {}, function(r)
+		cb(r.status == 0)
+	end)
+end
+
+local function ensure_sshd(engine: string, container: string, cb: (boolean) -> ())
+	local script = "which sshd >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq openssh-server); mkdir -p /run/sshd"
+	tern.process.run({ engine, "exec", "--user", "root", container, "sh", "-c", script }, {}, function(r)
+		cb(r.status == 0)
+	end)
+end
+
+local function ensure_authorized_keys(engine: string, container: string, cb: (boolean) -> ())
+	local ok, pub = pcall(tern.fs.read, tern.plugin.data .. "/" .. BRIDGE_KEY .. ".pub")
+	if not ok then
+		cb(false)
+		return
+	end
+	pub = string.gsub(pub, "%s+$", "")
+	local q = Resolve.shell_quote(pub)
+	local script = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && (grep -qxF "
+		.. q
+		.. " ~/.ssh/authorized_keys || echo "
+		.. q
+		.. " >> ~/.ssh/authorized_keys)"
+	tern.process.run({ engine, "exec", container, "sh", "-c", script }, {}, function(r)
+		cb(r.status == 0)
+	end)
+end
+
+function Bridge.write_alias(ws: string, container: string, user: string?, engine: string): boolean
+	local home = tern.getenv("HOME") or ""
+	local sshdir = home .. "/.ssh"
+	local cfg = sshdir .. "/config"
+	local alias = Bridge.alias_name(ws)
+	local begin = "# >>> tern-devcontainers " .. alias .. " >>>"
+	local finish = "# <<< tern-devcontainers " .. alias .. " <<<"
+	local lines = {
+		begin,
+		"Host " .. alias,
+		"  HostName " .. container,
+	}
+	if user ~= nil and user ~= "" then
+		table.insert(lines, "  User " .. user)
+	end
+	table.insert(lines, "  IdentityFile " .. tern.plugin.data .. "/" .. BRIDGE_KEY)
+	table.insert(lines, "  IdentitiesOnly yes")
+	table.insert(lines, "  UserKnownHostsFile " .. tern.plugin.data .. "/known_hosts")
+	table.insert(lines, "  StrictHostKeyChecking accept-new")
+	table.insert(lines, "  ProxyCommand " .. engine .. " exec -i --user root " .. container .. " /usr/sbin/sshd -i")
+	table.insert(lines, finish)
+	local block = table.concat(lines, "\n")
+	local text = ""
+	if tern.fs.exists(cfg) then
+		local ok, t = pcall(tern.fs.read, cfg)
+		if not ok then
+			return false
+		end
+		text = t
+	end
+	local s, e = string.find(text, begin .. ".-" .. finish)
+	if s ~= nil then
+		text = string.sub(text, 1, s - 1) .. block .. string.sub(text, e + 1)
+	else
+		if text ~= "" and string.sub(text, -1) ~= "\n" then
+			text = text .. "\n"
+		end
+		text = text .. block .. "\n"
+	end
+	local okw = pcall(function()
+		tern.fs.mkdir(sshdir)
+		tern.fs.write(cfg, text)
+	end)
+	return okw
+end
+
+function Bridge.provision(cx: any, ws: string, container: string, engine: string, cb: (boolean) -> ())
+	read_or_create_keypair(function(ok1)
+		if not ok1 then
+			cx:toast("error", "ssh-keygen is missing or failed")
+			cb(false)
+			return
+		end
+		ensure_sshd(engine, container, function(ok2)
+			if not ok2 then
+				cx:toast("error", "Could not install openssh-server in the container (Debian/Ubuntu images only in v1)")
+				cb(false)
+				return
+			end
+			ensure_authorized_keys(engine, container, function(ok3)
+				if not ok3 then
+					cx:toast("error", "Could not write authorized_keys in the container")
+					cb(false)
+					return
+				end
+				if not Bridge.write_alias(ws, container, Resolve.read_remote_user(ws), engine) then
+					cx:toast("error", "Could not write the SSH config alias")
+					cb(false)
+					return
+				end
+				cb(true)
+			end)
+		end)
+	end)
+end
+```
+
+- [ ] **Step 2: Replace the Task 5 `post_rebuild` with the real one**
+
+```lua
+local function post_rebuild(cx: any, ws: string)
+	if not Bridge.alias_exists(ws) then
+		cx:toast("info", "Container rebuilt — run 'Attach Tern to Container' for native reconnection", ws)
+		return
+	end
+	Resolve.detect_engine(function(engine)
+		if engine == nil then
+			return
+		end
+		Resolve.container_for_host(engine, ws, function(container)
+			if container == nil then
+				return
+			end
+			Bridge.provision(cx, ws, container, engine, function(ok)
+				if ok then
+					cx:toast("success", "Bridge ready — Tern is reconnecting to the container", container)
+				end
+			end)
+		end)
+	end)
+end
+```
+
+- [ ] **Step 3: Verify load**
+
+Run: `tern plugin list`
+Expected: `devcontainers … ready`.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add window.luau
+git commit -m "feat: ssh bridge — keypair, sshd ensure, authorized_keys, managed alias, silent re-provision"
+```
+
+### Task 7: Attach and reconnect commands
+
+**Files:**
+- Modify: `window.luau` (append after the four rebuild commands)
+
+**Interfaces:**
+- Consumes: `Resolve.find_config/detect_engine/container_info/read_remote_user`, `Bridge.provision/alias_name`, `cx:command("add_remote_host")`, `cx:command("switch_host")` (built-in palette commands, confirmed in the actions reference).
+- Produces: palette commands `plugin.devcontainers.attach`, `.reconnect`.
+
+- [ ] **Step 1: Add the two commands**
+
+```lua
+tern.command({
+	id = "attach",
+	title = "Attach Tern to Container",
+	icon = "branch",
+	group = "Dev Containers",
+	available = function(cx)
+		local cwd = focused_cwd(cx)
+		return cwd ~= nil and tern.fs.exists(cwd)
+	end,
+	run = function(cx)
+		local cwd = focused_cwd(cx)
+		if cwd == nil then
+			return
+		end
+		local ws = Resolve.find_config(cwd)
+		if ws == nil then
+			cx:toast("error", "No devcontainer config found in parent directories", cwd)
+			return
+		end
+		Resolve.detect_engine(function(engine)
+			if engine == nil then
+				cx:toast("error", "Neither docker nor podman is available")
+				return
+			end
+			Resolve.container_info(engine, cwd, function(info)
+				if info == nil then
+					cx:toast("error", "Focused pane is not inside a bind mount of a running container", cwd)
+					return
+				end
+				Bridge.provision(cx, info.ws, info.container, engine, function(ok)
+					if ok then
+						cx:toast("success", "Bridge ready — confirm the dialog to install Tern in the container", Bridge.alias_name(info.ws))
+						cx:command("add_remote_host")
+					end
+				end)
+			end)
+		end)
+	end,
+})
+
+tern.command({
+	id = "reconnect",
+	title = "Reconnect to Container Host",
+	icon = "terminal",
+	group = "Dev Containers",
+	available = function(cx)
+		local cwd = focused_cwd(cx)
+		return cwd ~= nil and tern.fs.exists(cwd)
+	end,
+	run = function(cx)
+		cx:command("switch_host")
+	end,
+})
+```
+
+- [ ] **Step 2: Verify load**
+
+Run: `tern plugin list`
+Expected: `devcontainers … ready` (six commands total).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add window.luau
+git commit -m "feat: attach and reconnect commands over the native host flow"
+```
+
+### Task 8: README and end-to-end verification matrix
 
 **Files:**
 - Create: `README.md`
 
 **Interfaces:**
-- Consumes: everything from Tasks 1–5.
+- Consumes: Tasks 1–7.
 - Produces: user-facing install/usage doc.
 
 - [ ] **Step 1: Write `README.md`**
@@ -512,51 +822,64 @@ git commit -m "feat: marker-poll completion, automatic exec re-entry, stale mark
 ```markdown
 # devcontainers — Tern plugin
 
-The four rebuild commands of the VSCode Dev Containers extension, verbatim,
-as Tern palette commands. Works with docker and podman.
+Dev containers as native Tern hosts, with the four rebuild commands of the
+VSCode Dev Containers extension, verbatim. Works with docker and podman.
+
+## Architecture
+
+Like VSCode: a server runs **inside** the container and your window stays
+local. Tern's session daemon is installed inside the container over Tern's
+own SSH host flow; container panes are native remote panes (they survive
+closing the window) and reconnect on their own after every rebuild.
+
+The plugin manages an SSH bridge: a dedicated keypair, `sshd -i` started
+per-connection through `docker/podman exec` (no ports, no daemon), and a
+managed `Host tern-<project>` block in `~/.ssh/config` that targets the
+container by name.
 
 ## Install
 
     tern plugin link /path/to/Tern-DevContainers
 
-Requires: `devcontainer` CLI (`npm i -g @devcontainers/cli`) and either
-`docker` or `podman` on PATH. Tern desktop (the web tab runs no Lua).
+Requires: `devcontainer` CLI (`npm i -g @devcontainers/cli`), OpenSSH
+(`ssh`, `ssh-keygen`), and `docker` or `podman`. Tern desktop.
 
 ## Commands (palette group "Dev Containers")
 
-| When | Command |
+| Command | When |
 | --- | --- |
-| Focused pane inside a dev container | Rebuild Container, Rebuild Container Without Cache |
-| Focused pane outside any dev container (any host folder; without config it errors like VSCode) | Rebuild and Reopen in Container, Rebuild Without Cache and Reopen in Container |
+| Rebuild Container / Rebuild Container Without Cache | focused pane inside a dev container |
+| Rebuild and Reopen in Container / Rebuild Without Cache and Reopen in Container | focused pane in any host folder (errors like VSCode when no config exists) |
+| Attach Tern to Container | first-time setup: provisions the bridge and opens Tern's native Add Remote Host dialog |
+| Reconnect to Container Host | opens the Hosts palette when the native reconnect needs a nudge |
 
-Each command opens a pane streaming the `devcontainer up` build logs. On
-success a second pane opens a shell inside the fresh container
-(`devcontainer exec ... bash`); on failure a toast shows the exit status and
-the log pane stays open.
+Rebuilds stream `devcontainer up` logs in a dedicated pane; on success the
+plugin re-provisions sshd and keys in the fresh container and Tern
+reconnects natively — no fingerprint prompts (`accept-new` with a
+plugin-private known_hosts file). Like VSCode reinstalling vscode-server,
+the container's ephemeral filesystem loses the daemon and Tern's SSH setup
+reinstalls it.
 
-"Inside" resolution is generic: the running containers are inspected
-(`docker`/`podman inspect`) and the bind mount whose destination covers the
-pane's cwd maps it back to its host path. Note: Microsoft officially supports
-docker; podman works via the docker-compatible CLI and is supported by this
-plugin, not by Microsoft.
+Note: Microsoft officially supports docker; podman works via the
+docker-compatible CLI and is supported by this plugin, not by Microsoft.
 ```
 
-- [ ] **Step 2: Fix the host `devcontainer` CLI (prerequisite for end-to-end)**
+- [ ] **Step 2: Fix the host `devcontainer` CLI**
 
 Run: `devcontainer --version`
-Expected today: `node: error while loading shared libraries: libsimdjson.so.33` — repair with `npm i -g @devcontainers/cli`, then re-run until a version prints.
+Expected today: `libsimdjson.so.33` error — repair with `npm i -g @devcontainers/cli` until a version prints.
 
-- [ ] **Step 3: End-to-end verification (GUI, after Step 2)**
+- [ ] **Step 3: End-to-end verification (GUI)**
 
-1. Host pane in Contagiar → *Rebuild and Reopen in Container* → live log pane → success toast → new shell pane inside the container (`vscode@…:/Contagiar`).
-2. Focus that container shell → *Rebuild Container* → host path resolved via inspect (watch the new rebuild pane's `--workspace-folder` shows `/hdd/.../Contagiar`) → rebuild → re-entry pane.
-3. *Rebuild Container Without Cache* → logs show feature layers building from scratch.
-4. Negative: duplicate trigger while first rebuild runs → "Rebuild already running" toast.
-5. Negative: focus `~` → run *Rebuild and Reopen in Container* → error toast `No devcontainer config found in parent directories`, no pane; same for the NoCache variant.
+1. Host pane in Contagiar → *Attach Tern to Container*: keypair appears in plugin data, `~/.ssh/config` gains the managed block, sshd installs in the container, native dialog opens; confirm with the alias → Tern's daemon runs inside; open a pane on that host, close the window, reopen — pane still alive.
+2. Host pane → *Rebuild and Reopen in Container*: live logs; after success the container host reconnects (host popover `connected`) with no fingerprint prompt.
+3. Container pane focused → *Rebuild Container*: alias resolves to the new container (rebuild pane's `--workspace-folder` shows the host path), bridge re-provisioned silently, reconnect again silent.
+4. *Rebuild Container Without Cache*: logs show feature layers from scratch.
+5. Negative: duplicate trigger → "Rebuild already running"; `~` → fuera rows visible, run → missing-config toast; missing CLI → log pane + error toast.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add README.md
-git commit -m "docs: README with install, commands and engine support"
+git commit -m "docs: README with native-host architecture and verification matrix"
 ```
