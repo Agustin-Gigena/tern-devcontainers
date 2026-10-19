@@ -13,7 +13,7 @@
 - Manifest keys exactly: `schema = 1`, `id = "devcontainers"`, `name = "Dev Containers"`, `version`, `description`, `icon`, `window = "window.luau"` — no other keys, no `host`, no `[[blocks]]`, no `[[lenses]]` (unknown keys are errors; `blocks`/`lenses` need a host entry).
 - Command ids: `rebuild`, `rebuild_no_cache`, `rebuild_reopen`, `rebuild_no_cache_reopen`; palette group `Dev Containers`; titles exactly `Rebuild Container`, `Rebuild Container Without Cache`, `Rebuild and Reopen in Container`, `Rebuild Without Cache and Reopen in Container`.
 - Rebuild command line always: `devcontainer up --workspace-folder <host_path> --remove-existing-container` plus ` --build-no-cache` only for the two NoCache commands; appended `; echo $? > <marker>`.
-- `available` budget 4 ms: `tern.fs.exists` calls and one `tern.kv.get` only; walk-up memoized in `tern.kv` keyed by cwd.
+- `available` budget 4 ms: focused-pane cwd lookup plus at most one `tern.fs.exists`; no directory walk-up (config discovery happens in `run`, where its cost is irrelevant — VSCode parity: "fuera" rows show for any host folder).
 - `run` budget 50 ms: never block; all engine/inspect work goes through `tern.process.run` callbacks (fresh `cx`).
 - Rebuild CLI is broken on this host (`node: libsimdjson.so.33` missing) — end-to-end verification of Tasks 5–6 requires fixing it first (`npm i -g @devcontainers/cli`).
 - No local `luau` binary exists: per-task verification is `tern plugin list` (status Ready; Failed shows the exact load error) plus GUI palette checks.
@@ -275,16 +275,6 @@ local function focused_cwd(cx: any): string?
 	return nil
 end
 
-local function host_gate(cwd: string): boolean
-	local hit = tern.kv.get("gate:" .. cwd)
-	if hit ~= nil then
-		return hit
-	end
-	local root = Resolve.find_config(cwd)
-	tern.kv.set("gate:" .. cwd, root ~= nil)
-	return root ~= nil
-end
-
 local function rebuild_command(ws: string, no_cache: boolean, marker: string): string
 	local cmd = "devcontainer up --workspace-folder "
 		.. Resolve.shell_quote(ws)
@@ -384,7 +374,7 @@ tern.command({
 	group = "Dev Containers",
 	available = function(cx)
 		local cwd = focused_cwd(cx)
-		return cwd ~= nil and host_gate(cwd)
+		return cwd ~= nil and tern.fs.exists(cwd)
 	end,
 	run = function(cx)
 		rebuild_fuera(cx, false)
@@ -398,7 +388,7 @@ tern.command({
 	group = "Dev Containers",
 	available = function(cx)
 		local cwd = focused_cwd(cx)
-		return cwd ~= nil and host_gate(cwd)
+		return cwd ~= nil and tern.fs.exists(cwd)
 	end,
 	run = function(cx)
 		rebuild_fuera(cx, true)
@@ -415,7 +405,7 @@ Expected: `devcontainers` → `Ready` (a bad command id such as `bind`, or a man
 
 1. Focus a pane inside a repo with `.devcontainer/` (host side): palette shows only `Rebuild and Reopen in Container` and `Rebuild Without Cache and Reopen in Container`.
 2. Focus a pane inside the dev container (`/Contagiar`-style path): palette shows only `Rebuild Container` and `Rebuild Container Without Cache`.
-3. Focus a pane in `~` or `/tmp`: none of the four rows appear.
+3. Focus a pane in `~` or `/tmp`: only the two "fuera" rows appear (VSCode parity: `workspaceFolderCount != 0` with any folder); running one toasts `No devcontainer config found in parent directories` and opens no pane.
 Expected: exactly the rows of the VSCode `when` matrix.
 
 - [ ] **Step 4: Commit**
@@ -537,7 +527,7 @@ Requires: `devcontainer` CLI (`npm i -g @devcontainers/cli`) and either
 | When | Command |
 | --- | --- |
 | Focused pane inside a dev container | Rebuild Container, Rebuild Container Without Cache |
-| Focused pane in a project with `.devcontainer/devcontainer.json` or `.devcontainer.json` | Rebuild and Reopen in Container, Rebuild Without Cache and Reopen in Container |
+| Focused pane outside any dev container (any host folder; without config it errors like VSCode) | Rebuild and Reopen in Container, Rebuild Without Cache and Reopen in Container |
 
 Each command opens a pane streaming the `devcontainer up` build logs. On
 success a second pane opens a shell inside the fresh container
@@ -561,7 +551,8 @@ Expected today: `node: error while loading shared libraries: libsimdjson.so.33` 
 1. Host pane in Contagiar → *Rebuild and Reopen in Container* → live log pane → success toast → new shell pane inside the container (`vscode@…:/Contagiar`).
 2. Focus that container shell → *Rebuild Container* → host path resolved via inspect (watch the new rebuild pane's `--workspace-folder` shows `/hdd/.../Contagiar`) → rebuild → re-entry pane.
 3. *Rebuild Container Without Cache* → logs show feature layers building from scratch.
-4. Negative: duplicate trigger while first rebuild runs → "Rebuild already running" toast; focus `~` → no rows.
+4. Negative: duplicate trigger while first rebuild runs → "Rebuild already running" toast.
+5. Negative: focus `~` → run *Rebuild and Reopen in Container* → error toast `No devcontainer config found in parent directories`, no pane; same for the NoCache variant.
 
 - [ ] **Step 4: Commit**
 

@@ -23,14 +23,16 @@ Window-half commands (`tern.command`), palette group "Dev Containers":
 |---|---|---|---|
 | `rebuild` | Dev Containers: Rebuild Container | `remoteName == dev-container` | focused pane `cwd ≠ ""` and `not tern.fs.exists(cwd)` (path only exists inside a container namespace) |
 | `rebuild_no_cache` | Dev Containers: Rebuild Container Without Cache | same | same |
-| `rebuild_reopen` | Dev Containers: Rebuild and Reopen in Container | `workspaceFolderCount != 0 && !remoteName` | `cwd` exists; walk-up (≤16 levels) finds `.devcontainer/devcontainer.json` or `.devcontainer.json` |
+| `rebuild_reopen` | Dev Containers: Rebuild and Reopen in Container | `workspaceFolderCount != 0 && !remoteName` | `tern.fs.exists(cwd)` (any host folder — VSCode shows it with any workspace; config discovery happens at execution) |
 | `rebuild_no_cache_reopen` | Dev Containers: Rebuild Without Cache and Reopen in Container | same | same |
 
-`available` budget is 4 ms: only cheap `tern.fs.exists` calls, never process
-spawns. The walk-up is memoized in `tern.kv` keyed by `cwd` (shared
-`kv.json`, re-read on mtime change) so repeated palette opens do one lookup;
-a miss recomputes the walk once. Container membership is confirmed at
-execution time, not in `available`.
+`available` budget is 4 ms: a focused-pane cwd lookup plus one
+`tern.fs.exists` call, never process spawns and never a directory walk-up.
+Matching the official `when` clause
+(`workspaceFolderCount != 0 && !remoteName`), the two "fuera" rows show for
+any host folder; config discovery happens at execution time and toasts an
+error when no `.devcontainer` config is found. Container membership is
+confirmed at execution time, not in `available`.
 
 ## Architecture
 
@@ -113,7 +115,8 @@ events.
 | `devcontainer` CLI missing or broken | Pane shows the CLI's error live; nonzero exit → toast pointing at the log pane |
 | docker and podman both missing (variant "dentro") | Toast error, no pane opened |
 | cwd unknown (`""`) | `available` hides all four rows |
-| Repo uses root `.devcontainer.json` | Walk-up checks both locations (spec default) |
+| Repo uses root `.devcontainer.json` | Walk-up checks both locations (spec default, confirmed: CLI checks the same two) |
+| No config in any parent directory ("fuera" run in a random folder) | Error toast `No devcontainer config found in parent directories`, no pane opened — VSCode shows the command with any open folder and fails at execution the same way |
 | Alternative config subfolders of `.devcontainer/` | Out of scope for v1 (no picker, as VSCode has) |
 | Tern reload mid-rebuild | Rebuild continues (it is the shell's process); timers die with the VM, so automatic re-entry is lost — log pane shows the final status for a manual exec; stale markers are overwritten (unique id per rebuild) |
 | iOS client / web tab | No Lua there; plugin requires Tern desktop with local session daemon (documented in README) |
@@ -151,8 +154,10 @@ Host `devcontainer` CLI is currently broken on this machine
    run *Rebuild Container* → a container-only path (e.g. `/Contagiar`) resolved
    to its host path via inspect → rebuild → automatic re-entry.
 4. NoCache variants: feature layers rebuild from scratch (visible in logs).
-5. Negative: `available` rows hidden outside projects; duplicate-rebuild guard
-   toasts; missing CLI surfaces through the log pane + error toast.
+5. Negative: with a pane in `~` or `/tmp`, only the two "fuera" rows show
+   (VSCode parity: any open folder); running one toasts the missing-config
+   error and opens no pane; duplicate-rebuild guard toasts; missing CLI
+   surfaces through the log pane + error toast.
 
 ## Explicit non-goals (v1)
 
