@@ -126,6 +126,15 @@ tern plugin link /hdd/Linux/agigena/Repositorios/Tern-DevContainers
 
 Linked package: edits hot-reload; `tern plugin install` copies instead.
 
+## Engine support
+
+- **docker**: officially supported by Microsoft (docs: system requirements).
+- **podman**: works through the docker-compatible CLI (this machine's `docker`
+  is a podman shim) and `podman inspect` exposes `Mounts[].Source/Destination`
+  in docker-compatible JSON; but Microsoft states other Docker-compliant CLIs
+  "may work, they are not officially supported". This plugin supports podman
+  explicitly via the docker→podman fallback.
+
 ## Prerequisite
 
 Host `devcontainer` CLI is currently broken on this machine
