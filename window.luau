@@ -331,6 +331,60 @@ tern.command({
 	end,
 })
 
+tern.command({
+	id = "attach",
+	title = "Attach Tern to Container",
+	icon = "branch",
+	group = "Dev Containers",
+	available = function(cx)
+		local cwd = focused_cwd(cx)
+		return cwd ~= nil and tern.fs.exists(cwd)
+	end,
+	run = function(cx)
+		local cwd = focused_cwd(cx)
+		if cwd == nil then
+			return
+		end
+		local ws = Resolve.find_config(cwd)
+		if ws == nil then
+			cx:toast("error", "No devcontainer config found in parent directories", cwd)
+			return
+		end
+		Resolve.detect_engine(function(engine)
+			if engine == nil then
+				cx:toast("error", "Neither docker nor podman is available")
+				return
+			end
+			Resolve.container_info(engine, cwd, function(info)
+				if info == nil then
+					cx:toast("error", "Focused pane is not inside a bind mount of a running container", cwd)
+					return
+				end
+				Bridge.provision(cx, info.ws, info.container, engine, function(ok)
+					if ok then
+						cx:toast("success", "Bridge ready — confirm the dialog to install Tern in the container", Bridge.alias_name(info.ws))
+						cx:command("add_remote_host")
+					end
+				end)
+			end)
+		end)
+	end,
+})
+
+tern.command({
+	id = "reconnect",
+	title = "Reconnect to Container Host",
+	icon = "terminal",
+	group = "Dev Containers",
+	available = function(cx)
+		local cwd = focused_cwd(cx)
+		return cwd ~= nil and tern.fs.exists(cwd)
+	end,
+	run = function(cx)
+		cx:command("switch_host")
+	end,
+})
+
 tern.on("window_start", function(_cx)
 	for _, name in tern.fs.list(tern.plugin.data) do
 		if string.match(name, "^rebuild-%d+%.status$") then
