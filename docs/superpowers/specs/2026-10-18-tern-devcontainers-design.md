@@ -152,9 +152,11 @@ integration, which the docs do not guarantee for `launch.command` panes:
 - Status 0 → toast success, then **re-provision the bridge** in the fresh
   container (sshd ensure + authorized_keys + alias refresh — the fresh
   container lost the sshd binary). Tern's native host link reconnects on its
-  own (alias unchanged, `sshd -i` per connection); when it is back, container
-  panes are available again. If the daemon needs reinstalling, Tern's SSH
-  setup handles it as on any remote host.
+  own (alias unchanged, `sshd -i` per connection). When provisioning succeeds
+  the plugin runs `cx:command("new_session_on_host")` so a pane **inside the
+  container** lands focused — the user-visible outcome of VSCode's window
+  reload/reopen. If the daemon needs reinstalling, Tern's SSH setup handles
+  it as on any remote host.
 - Status ≠ 0 → toast error with exit code; log pane stays open.
 
 First attach (per project, manual-by-design): run *Attach Tern to Container*
@@ -210,7 +212,8 @@ tern plugin link /hdd/Linux/agigena/Repositorios/Tern-DevContainers
    pane in the container survives closing the window.
 3. Host pane in the repo → *Rebuild and Reopen in Container*: live logs, and
    after success the host link reconnects (host popover state `connected`)
-   without fingerprint prompts.
+   without fingerprint prompts and a **pane inside the container** is
+   available and focused (via the New Session flow the plugin opens).
 4. Container pane focused → *Rebuild Container*: alias resolves to the new
    container; bridge re-provisioned; reconnect again silent.
 5. NoCache variants: feature layers rebuild from scratch (logs).

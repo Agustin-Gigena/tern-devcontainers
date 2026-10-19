@@ -470,10 +470,10 @@ git commit -m "feat: four VSCode-parity rebuild commands"
   - `post_rebuild(cx, ws: string)` — if the project's alias block exists in `~/.ssh/config` (attached before), silently re-provisions the bridge in the fresh container; otherwise toasts the attach hint. Task 6 supplies `Bridge.provision` and `Bridge.alias_exists`.
   - Poll loop: 500 ms re-arming timer; success → toast + `post_rebuild`; failure → toast with exit status.
 
-- [ ] **Step 1: Add a temporary `post_rebuild` (declared BEFORE the poll so `poll` captures the local, not a global)**
+- [ ] **Step 1: Add a temporary `post_rebuild` (chunk-scope local variable, declared BEFORE the poll so `poll` captures the variable — Task 6 reassigns it)**
 
 ```lua
-local function post_rebuild(cx: any, _ws: string)
+local post_rebuild: ((any, string) -> ()) = function(cx: any, _ws: string)
 	cx:toast("info", "Container rebuilt — run 'Attach Tern to Container' to enable native reconnection")
 end
 ```
@@ -691,10 +691,10 @@ function Bridge.provision(cx: any, ws: string, container: string, engine: string
 end
 ```
 
-- [ ] **Step 2: Replace the Task 5 `post_rebuild` with the real one**
+- [ ] **Step 2: Replace the Task 5 `post_rebuild` (REASSIGN the same variable — no `local`, so `poll`'s captured upvalue sees the real implementation)**
 
 ```lua
-local function post_rebuild(cx: any, ws: string)
+post_rebuild = function(cx: any, ws: string)
 	if not Bridge.alias_exists(ws) then
 		cx:toast("info", "Container rebuilt — run 'Attach Tern to Container' for native reconnection", ws)
 		return
@@ -710,6 +710,7 @@ local function post_rebuild(cx: any, ws: string)
 			Bridge.provision(cx, ws, container, engine, function(ok)
 				if ok then
 					cx:toast("success", "Bridge ready — Tern is reconnecting to the container", container)
+					cx:command("new_session_on_host")
 				end
 			end)
 		end)
@@ -872,7 +873,7 @@ Expected today: `libsimdjson.so.33` error — repair with `npm i -g @devcontaine
 - [ ] **Step 3: End-to-end verification (GUI)**
 
 1. Host pane in Contagiar → *Attach Tern to Container*: keypair appears in plugin data, `~/.ssh/config` gains the managed block, sshd installs in the container, native dialog opens; confirm with the alias → Tern's daemon runs inside; open a pane on that host, close the window, reopen — pane still alive.
-2. Host pane → *Rebuild and Reopen in Container*: live logs; after success the container host reconnects (host popover `connected`) with no fingerprint prompt.
+2. Host pane → *Rebuild and Reopen in Container*: live logs; after success the container host reconnects (host popover `connected`) with no fingerprint prompt, and a pane inside the container is available and focused via the New Session flow.
 3. Container pane focused → *Rebuild Container*: alias resolves to the new container (rebuild pane's `--workspace-folder` shows the host path), bridge re-provisioned silently, reconnect again silent.
 4. *Rebuild Container Without Cache*: logs show feature layers from scratch.
 5. Negative: duplicate trigger → "Rebuild already running"; `~` → fuera rows visible, run → missing-config toast; missing CLI → log pane + error toast.
