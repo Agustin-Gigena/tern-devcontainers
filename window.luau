@@ -18,9 +18,7 @@ local function focused_cwd(cx: any): string?
 	return nil
 end
 
-local post_rebuild: ((any, string) -> ()) = function(cx: any, _ws: string)
-	cx:toast("info", "Container rebuilt — run 'Attach Tern to Container' to enable native reconnection")
-end
+local post_rebuild: ((any, string) -> ())
 
 local polling = false
 
@@ -120,8 +118,10 @@ function Bridge.write_alias(ws: string, container: string, user: string?, engine
 		end
 		text = text .. block .. "\n"
 	end
-	local okw = pcall(function()
+	if not tern.fs.exists(sshdir) then
 		tern.fs.mkdir(sshdir)
+	end
+	local okw = pcall(function()
 		tern.fs.write(cfg, text)
 	end)
 	return okw
@@ -136,7 +136,7 @@ function Bridge.provision(cx: any, ws: string, container: string, engine: string
 		end
 		ensure_sshd(engine, container, function(ok2)
 			if not ok2 then
-				cx:toast("error", "Could not install openssh-server in the container (Debian/Ubuntu images only in v1)")
+				cx:toast("error", "Could not install openssh-server in the container (Debian/Ubuntu images only) — install it manually")
 				cb(false)
 				return
 			end
@@ -181,9 +181,20 @@ post_rebuild = function(cx: any, ws: string)
 end
 
 local function poll(cx: any)
+	local live = {}
+	for _, pane in cx.session:panes() do
+		live[pane.pane] = true
+	end
+	for pane, entry in pending do
+		if not live[pane] then
+			pending[pane] = nil
+			pcall(tern.fs.remove, entry.marker)
+			cx:toast("info", "Rebuild pane closed — the rebuild may still be running", entry.ws)
+		end
+	end
 	for pane, entry in pending do
 		local ok, text = pcall(tern.fs.read, entry.marker)
-		if ok then
+		if ok and type(text) == "string" then
 			local status = tonumber((string.gsub(text, "%s+", ""))) or -1
 			pending[pane] = nil
 			pcall(tern.fs.remove, entry.marker)
@@ -281,6 +292,11 @@ local function inside_gate(cx: any): boolean
 	return cwd ~= nil and not tern.fs.exists(cwd)
 end
 
+local function outside_gate(cx: any): boolean
+	local cwd = focused_cwd(cx)
+	return cwd ~= nil and tern.fs.exists(cwd)
+end
+
 tern.command({
 	id = "rebuild",
 	title = "Rebuild Container",
@@ -308,10 +324,7 @@ tern.command({
 	title = "Rebuild and Reopen in Container",
 	icon = "terminal",
 	group = "Dev Containers",
-	available = function(cx)
-		local cwd = focused_cwd(cx)
-		return cwd ~= nil and tern.fs.exists(cwd)
-	end,
+	available = outside_gate,
 	run = function(cx)
 		rebuild_fuera(cx, false)
 	end,
@@ -322,10 +335,7 @@ tern.command({
 	title = "Rebuild Without Cache and Reopen in Container",
 	icon = "terminal",
 	group = "Dev Containers",
-	available = function(cx)
-		local cwd = focused_cwd(cx)
-		return cwd ~= nil and tern.fs.exists(cwd)
-	end,
+	available = outside_gate,
 	run = function(cx)
 		rebuild_fuera(cx, true)
 	end,
@@ -336,10 +346,7 @@ tern.command({
 	title = "Attach Tern to Container",
 	icon = "branch",
 	group = "Dev Containers",
-	available = function(cx)
-		local cwd = focused_cwd(cx)
-		return cwd ~= nil and tern.fs.exists(cwd)
-	end,
+	available = outside_gate,
 	run = function(cx)
 		local cwd = focused_cwd(cx)
 		if cwd == nil then
@@ -355,14 +362,14 @@ tern.command({
 				cx:toast("error", "Neither docker nor podman is available")
 				return
 			end
-			Resolve.container_info(engine, cwd, function(info)
-				if info == nil then
-					cx:toast("error", "Focused pane is not inside a bind mount of a running container", cwd)
+			Resolve.container_for_host(engine, ws, function(container)
+				if container == nil then
+					cx:toast("error", "No running container is bind-mounting this workspace", ws)
 					return
 				end
-				Bridge.provision(cx, info.ws, info.container, engine, function(ok)
+				Bridge.provision(cx, ws, container, engine, function(ok)
 					if ok then
-						cx:toast("success", "Bridge ready — confirm the dialog to install Tern in the container", Bridge.alias_name(info.ws))
+						cx:toast("success", "Bridge ready — confirm the dialog to install Tern in the container", Bridge.alias_name(ws))
 						cx:command("add_remote_host")
 					end
 				end)
@@ -376,19 +383,43 @@ tern.command({
 	title = "Reconnect to Container Host",
 	icon = "terminal",
 	group = "Dev Containers",
-	available = function(cx)
-		local cwd = focused_cwd(cx)
-		return cwd ~= nil and tern.fs.exists(cwd)
-	end,
+	available = outside_gate,
 	run = function(cx)
-		cx:command("switch_host")
+		local cwd = focused_cwd(cx)
+		if cwd == nil then
+			return
+		end
+		local ws = Resolve.find_config(cwd)
+		if ws == nil then
+			cx:toast("error", "No devcontainer config found in parent directories", cwd)
+			return
+		end
+		Resolve.detect_engine(function(engine)
+			if engine == nil then
+				cx:toast("error", "Neither docker nor podman is available")
+				return
+			end
+			Resolve.container_for_host(engine, ws, function(container)
+				if container == nil then
+					cx:toast("error", "No running container is bind-mounting this workspace", ws)
+					return
+				end
+				Bridge.provision(cx, ws, container, engine, function(ok)
+					if ok then
+						cx:command("switch_host")
+					end
+				end)
+			end)
+		end)
 	end,
 })
 
 tern.on("window_start", function(_cx)
-	for _, name in tern.fs.list(tern.plugin.data) do
-		if string.match(name, "^rebuild-%d+%.status$") then
-			pcall(tern.fs.remove, tern.plugin.data .. "/" .. name)
+	pcall(function()
+		for _, name in tern.fs.list(tern.plugin.data) do
+			if string.match(name, "^rebuild-%d+%.status$") then
+				pcall(tern.fs.remove, tern.plugin.data .. "/" .. name)
+			end
 		end
-	end
+	end)
 end)

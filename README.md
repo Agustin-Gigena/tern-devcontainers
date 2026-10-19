@@ -41,4 +41,6 @@ reinstalls it.
 Note: Microsoft officially supports docker; podman works via the
 docker-compatible CLI and is supported by this plugin, not by Microsoft.
 Workspace folder names containing spaces produce ssh aliases whose names
-must be quoted manually in `~/.ssh/config`.
+must be quoted manually in `~/.ssh/config`. `authorized_keys` is written
+for the container's default user; if your `remoteUser` differs, add the
+key manually.
