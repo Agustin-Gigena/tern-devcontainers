@@ -18,6 +18,42 @@ local function focused_cwd(cx: any): string?
 	return nil
 end
 
+local post_rebuild: ((any, string) -> ()) = function(cx: any, _ws: string)
+	cx:toast("info", "Container rebuilt — run 'Attach Tern to Container' to enable native reconnection")
+end
+
+local polling = false
+
+local function poll(cx: any)
+	for pane, entry in pending do
+		local ok, text = pcall(tern.fs.read, entry.marker)
+		if ok then
+			local status = tonumber((string.gsub(text, "%s+", ""))) or -1
+			pending[pane] = nil
+			pcall(tern.fs.remove, entry.marker)
+			if status == 0 then
+				cx:toast("success", "Rebuilt", entry.ws)
+				post_rebuild(cx, entry.ws)
+			else
+				cx:toast("error", "Rebuild failed (exit " .. status .. ")", entry.ws)
+			end
+		end
+	end
+	if next(pending) ~= nil then
+		tern.timer(500, poll)
+	else
+		polling = false
+	end
+end
+
+local function start_polling()
+	if polling then
+		return
+	end
+	polling = true
+	tern.timer(500, poll)
+end
+
 local function rebuild_command(ws: string, no_cache: boolean, marker: string): string
 	local cmd = "devcontainer up --workspace-folder "
 		.. Resolve.shell_quote(ws)
@@ -46,6 +82,7 @@ local function start_rebuild(cx: any, ws: string, no_cache: boolean)
 		return
 	end
 	pending[pane] = { ws = ws, marker = marker }
+	start_polling()
 end
 
 local function rebuild_dentro(cx: any, no_cache: boolean)
@@ -137,3 +174,11 @@ tern.command({
 		rebuild_fuera(cx, true)
 	end,
 })
+
+tern.on("window_start", function(_cx)
+	for _, name in tern.fs.list(tern.plugin.data) do
+		if string.match(name, "^rebuild-%d+%.status$") then
+			pcall(tern.fs.remove, tern.plugin.data .. "/" .. name)
+		end
+	end
+end)
