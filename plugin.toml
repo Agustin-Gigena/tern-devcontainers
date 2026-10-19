@@ -1,0 +1,7 @@
+schema = 1
+id = "devcontainers"
+name = "Dev Containers"
+version = "0.2.0"
+description = "Dev containers as native Tern hosts: VSCode-parity rebuilds and native reconnection."
+icon = "box"
+window = "window.luau"
