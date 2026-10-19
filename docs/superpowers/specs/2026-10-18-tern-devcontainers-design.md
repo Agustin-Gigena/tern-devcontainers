@@ -124,8 +124,8 @@ Host `devcontainer` CLI is currently broken on this machine
    "fuera" rows; run *Rebuild and Reopen in Container* → live log pane → new
    shell inside the container.
 3. Focused pane inside the container: palette shows only the two "dentro" rows;
-   run *Rebuild Container* → `/Contagiar`-style path resolved to host path via
-   inspect → rebuild → automatic re-entry.
+   run *Rebuild Container* → a container-only path (e.g. `/Contagiar`) resolved
+   to its host path via inspect → rebuild → automatic re-entry.
 4. NoCache variants: feature layers rebuild from scratch (visible in logs).
 5. Negative: `available` rows hidden outside projects; duplicate-rebuild guard
    toasts; missing CLI surfaces through the log pane + error toast.
