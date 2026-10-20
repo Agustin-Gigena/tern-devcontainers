@@ -43,6 +43,85 @@ function Bridge.alias_exists(ws: string): boolean
 	return string.find(text, "Host " .. Bridge.alias_name(ws) .. "\n", 1, true) ~= nil
 end
 
+-- SSH destinations in ~/.ssh/config the person already has (their own Host
+-- entries): candidates to reach an SSH-host machine for the two-hop tunnel.
+function Bridge.upstream_hosts(): { string }
+	local home = tern.getenv("HOME") or ""
+	local out: { string } = {}
+	local ok, text = pcall(tern.fs.read, home .. "/.ssh/config")
+	if not ok then
+		return out
+	end
+	for line in string.gmatch(text, "[^\n]+") do
+		local h = string.match(line, "^%s*Host%s+(.+)%s*$")
+		if h ~= nil and not string.find(line, "=") then
+			for entry in string.gmatch(h, "%S+") do
+				if
+					entry ~= "*"
+					and not string.find(entry, "[*?]")
+					and string.sub(entry, 1, 5) ~= "tern-"
+				then
+					table.insert(out, entry)
+				end
+			end
+		end
+	end
+	return out
+end
+
+function Bridge.write_remote_alias(ws: string, user: string?, upstream: string): boolean
+	local home = tern.getenv("HOME") or ""
+	local sshdir = home .. "/.ssh"
+	local cfg = sshdir .. "/config"
+	local alias = "tern-" .. upstream .. "-" .. (string.match(ws, "[^/]+$") or "dev")
+	local begin = "# >>> tern-devcontainers " .. alias .. " >>>"
+	local finish = "# <<< tern-devcontainers " .. alias .. " <<<"
+	local lines = {
+		begin,
+		"Host " .. alias,
+		"  HostName " .. (string.match(ws, "[^/]+$") or "devcontainer"),
+	}
+	if user ~= nil and user ~= "" then
+		table.insert(lines, "  User " .. user)
+	end
+	table.insert(lines, "  IdentityFile " .. tern.plugin.data .. "/" .. BRIDGE_KEY)
+	table.insert(lines, "  IdentitiesOnly yes")
+	table.insert(lines, "  UserKnownHostsFile " .. tern.plugin.data .. "/known_hosts")
+	table.insert(lines, "  StrictHostKeyChecking no")
+	local proxy = "ssh -o BatchMode=yes -o StrictHostKeyChecking=no "
+		.. upstream
+		.. ' "docker exec -i --user root \\"$(docker ps -q --filter label=devcontainer.local_folder='
+		.. Resolve.shell_quote(ws)
+		.. ' | head -1)\\" /usr/sbin/sshd -i"'
+	table.insert(lines, "  ProxyCommand " .. proxy)
+	table.insert(lines, finish)
+	local block = table.concat(lines, "\n")
+	local text = ""
+	if tern.fs.exists(cfg) then
+		local ok, t = pcall(tern.fs.read, cfg)
+		if not ok then
+			return false
+		end
+		text = t
+	end
+	local s, e = string.find(text, begin .. ".-" .. finish)
+	if s ~= nil then
+		text = string.sub(text, 1, s - 1) .. block .. string.sub(text, e + 1)
+	else
+		if text ~= "" and string.sub(text, -1) ~= "\n" then
+			text = text .. "\n"
+		end
+		text = text .. block .. "\n"
+	end
+	if not tern.fs.exists(sshdir) then
+		tern.fs.mkdir(sshdir)
+	end
+	local okw = pcall(function()
+		tern.fs.write(cfg, text)
+	end)
+	return okw
+end
+
 local function read_or_create_keypair(cb: (boolean) -> ())
 	local priv = tern.plugin.data .. "/" .. BRIDGE_KEY
 	if tern.fs.exists(priv) then
@@ -206,6 +285,95 @@ local function remote_pane(cx: any): number?
 	return nil
 end
 
+-- Attach to a devcontainer that lives on an SSH-host machine: the
+-- provisioning runs inside that machine's pane (its docker, its paths)
+-- and completion is polled through the person's own ssh upstream.
+local function remote_attach(cx: any, pane: number, cwd: string)
+	local upstreams = Bridge.upstream_hosts()
+	local upstream: string? = nil
+	for _, h in upstreams do
+		if h == "tern-upstream" then
+			upstream = h
+			break
+		end
+	end
+	if upstream == nil and #upstreams == 1 then
+		upstream = upstreams[1]
+	end
+	if upstream == nil then
+		cx:toast("error", "Agregá el Host de la máquina remota a ~/.ssh/config (una entrada Host propia, sin wildcards) y volvé a correr Attach")
+		return
+	end
+	read_or_create_keypair(function(ok)
+		if not ok then
+			cx:toast("error", "ssh-keygen is missing or failed")
+			return
+		end
+		local okp, pub = pcall(tern.fs.read, tern.plugin.data .. "/" .. BRIDGE_KEY .. ".pub")
+		if not okp then
+			cx:toast("error", "Could not read the plugin keypair")
+			return
+		end
+		pub = string.gsub(pub, "%s+$", "")
+		local q = Resolve.shell_quote(pub)
+		local script = table.concat({
+			"d=$(pwd)",
+			"i=0",
+			'while [ "$i" -lt 16 ]; do',
+			'[ -f "$d/.devcontainer/devcontainer.json" ] && break',
+			'[ -f "$d/.devcontainer.json" ] && break',
+			"d=${d%/*}",
+			'[ "$d" = "/" ] && break',
+			"i=$((i+1)); done",
+			"command -v devcontainer >/dev/null 2>&1 || npm install -g @devcontainers/cli >/dev/null 2>&1",
+			"U=$(devcontainer read-configuration --workspace-folder \"$d\" 2>/dev/null | sed -n 's/.*\"remoteUser\": *\"\\([^\"]*\\)\".*/\\1/p' | head -1)",
+			'C=$(docker ps -q --filter label=devcontainer.local_folder="$d" | head -1)',
+			"docker exec --user root \"$C\" sh -c 'which sshd >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq openssh-server); mkdir -p /run/sshd'",
+			"docker exec --user \"${U:-$(docker exec \"$C\" id -un)}\" \"$C\" sh -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && (grep -qxF "
+				.. q
+				.. " ~/.ssh/authorized_keys || echo "
+				.. q
+				.. " >> ~/.ssh/authorized_keys)'",
+			'printf %s "$U" > /tmp/tern-dc-user',
+			'printf %s "$d" > /tmp/tern-dc-ws',
+			"touch /tmp/tern-dc-attach.done",
+		}, "; ")
+		cx:run(pane, "sh -c " .. Resolve.shell_quote(script) .. "\r")
+		cx:toast("info", "Provisionando el container en la máquina remota…", upstream)
+		local tries = 0
+		local function check()
+			tries = tries + 1
+			tern.process.run(
+				{ "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", upstream, "test -f /tmp/tern-dc-attach.done" },
+				{},
+				function(r)
+					if r.status == 0 then
+						tern.process.run(
+							{ "ssh", "-o", "BatchMode=yes", upstream, "cat /tmp/tern-dc-user /tmp/tern-dc-ws" },
+							{},
+							function(r2)
+								local u = string.match(r2.stdout, "([^\n]+)")
+								local w = string.match(r2.stdout, "\n([^\n]+)$")
+								if Bridge.write_remote_alias(w or cwd, u, upstream) then
+									cx:toast("success", "Container remoto listo — confirmá el diálogo para instalar Tern", upstream)
+									cx:command("add_remote_host")
+								else
+									cx:toast("error", "Could not write the SSH config alias")
+								end
+							end
+						)
+					elseif tries < 30 then
+						tern.timer(2000, check)
+					else
+						cx:toast("error", "No pude verificar por ssh (" .. upstream .. ") — necesitás key autorizada en esa máquina; mirá el pane remoto")
+					end
+				end
+			)
+		end
+		tern.timer(3000, check)
+	end)
+end
+
 post_rebuild = function(cx: any, ws: string)
 	if not Bridge.alias_exists(ws) then
 		cx:toast("info", "Container rebuilt — run 'Attach Tern to Container' for native reconnection", ws)
@@ -304,12 +472,46 @@ local function start_rebuild(cx: any, ws: string, no_cache: boolean)
 	start_polling()
 end
 
+local function focused_pane_id(cx: any): number?
+	local id = cx.session:focused()
+	if id == nil then
+		return nil
+	end
+	for _, pane in cx.session:panes() do
+		if pane.pane == id then
+			return pane.pane
+		end
+	end
+	return nil
+end
+
+-- Rebuild on an SSH-host pane: the CLI runs on that machine, inside the
+-- pane's own shell, where the person watches the logs.
+local function remote_rebuild(cx: any, pane: number, no_cache: boolean)
+	local script = table.concat({
+		"d=$(pwd)",
+		"i=0",
+		'while [ "$i" -lt 16 ]; do',
+		'[ -f "$d/.devcontainer/devcontainer.json" ] && break',
+		'[ -f "$d/.devcontainer.json" ] && break',
+		"d=${d%/*}",
+		'[ "$d" = "/" ] && break',
+		"i=$((i+1)); done",
+		"command -v devcontainer >/dev/null 2>&1 || npm install -g @devcontainers/cli >/dev/null 2>&1",
+		'devcontainer up --workspace-folder "$d" --remove-existing-container'
+			.. (if no_cache then " --build-no-cache" else ""),
+	}, "; ")
+	cx:run(pane, "sh -c " .. Resolve.shell_quote(script) .. "\r")
+	cx:toast("info", "Rebuild corriendo en el pane remoto — al terminar, Reconnect reconecta el host")
+end
+
 local function rebuild_dentro(cx: any, no_cache: boolean)
 	local cwd = focused_cwd(cx)
 	if cwd == nil then
 		cx:toast("error", "No focused pane with a working directory")
 		return
 	end
+	local pane = focused_pane_id(cx)
 	Resolve.detect_engine(function(engine)
 		if engine == nil then
 			cx:toast("error", "Neither docker nor podman is available")
@@ -317,7 +519,9 @@ local function rebuild_dentro(cx: any, no_cache: boolean)
 		end
 		Resolve.container_info(engine, cwd, function(info)
 			if info == nil then
-				cx:toast("error", "Focused pane is not inside a bind mount of a running container", cwd)
+				-- Not a local container: the pane lives on another machine
+				-- (SSH host). Run the rebuild inside that pane's shell.
+				remote_rebuild(cx, pane, no_cache)
 				return
 			end
 			start_rebuild(cx, info.ws, no_cache)
@@ -408,8 +612,21 @@ tern.command({
 	title = "Attach Tern to Container",
 	icon = "branch",
 	group = "Dev Containers",
-	available = outside_gate,
+	available = function(cx)
+		return focused_cwd(cx) ~= nil
+	end,
 	run = function(cx)
+		local cwd = focused_cwd(cx)
+		if cwd == nil then
+			return
+		end
+		if not tern.fs.exists(cwd) then
+			local pane = focused_pane_id(cx)
+			if pane ~= nil then
+				remote_attach(cx, pane, cwd)
+			end
+			return
+		end
 		local ws = resolve_ws(cx)
 		if ws == nil then
 			cx:toast("error", "No devcontainer config found — open a file of the project in the editor once, or cd into it", focused_cwd(cx) or "")
@@ -435,8 +652,21 @@ tern.command({
 	title = "Reconnect to Container Host",
 	icon = "terminal",
 	group = "Dev Containers",
-	available = outside_gate,
+	available = function(cx)
+		return focused_cwd(cx) ~= nil
+	end,
 	run = function(cx)
+		local cwd = focused_cwd(cx)
+		if cwd == nil then
+			return
+		end
+		if not tern.fs.exists(cwd) then
+			local pane = focused_pane_id(cx)
+			if pane ~= nil then
+				remote_attach(cx, pane, cwd)
+			end
+			return
+		end
 		local ws = resolve_ws(cx)
 		if ws == nil then
 			cx:toast("error", "No devcontainer config found — open a file of the project in the editor once, or cd into it", focused_cwd(cx) or "")
