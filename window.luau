@@ -237,13 +237,16 @@ local function start_polling()
 end
 
 local function rebuild_command(ws: string, no_cache: boolean, marker: string): string
-	local cmd = "devcontainer up --workspace-folder "
+	local inner = "devcontainer up --workspace-folder "
 		.. Resolve.shell_quote(ws)
 		.. " --remove-existing-container"
 	if no_cache then
-		cmd = cmd .. " --build-no-cache"
+		inner = inner .. " --build-no-cache"
 	end
-	return cmd .. "; echo $? > " .. Resolve.shell_quote(marker)
+	inner = inner .. "; echo $? > " .. Resolve.shell_quote(marker)
+	-- The pane runs the line through the login shell, which may be fish
+	-- (no `$?`): run POSIX syntax under an explicit sh.
+	return "sh -c " .. Resolve.shell_quote(inner)
 end
 
 local function start_rebuild(cx: any, ws: string, no_cache: boolean)
@@ -306,7 +309,7 @@ end
 local function rebuild_fuera(cx: any, no_cache: boolean)
 	local ws = resolve_ws(cx)
 	if ws == nil then
-		cx:toast("error", "No devcontainer config found — open a file or folder of the project in the editor once", focused_cwd(cx) or "")
+		cx:toast("error", "No devcontainer config found — open a file of the project in the editor once, or cd into it", focused_cwd(cx) or "")
 		return
 	end
 	start_rebuild(cx, ws, no_cache)
@@ -375,7 +378,7 @@ tern.command({
 	run = function(cx)
 		local ws = resolve_ws(cx)
 		if ws == nil then
-			cx:toast("error", "No devcontainer config found — open a file or folder of the project in the editor once", focused_cwd(cx) or "")
+			cx:toast("error", "No devcontainer config found — open a file of the project in the editor once, or cd into it", focused_cwd(cx) or "")
 			return
 		end
 		Resolve.detect_engine(function(engine)
@@ -408,7 +411,7 @@ tern.command({
 	run = function(cx)
 		local ws = resolve_ws(cx)
 		if ws == nil then
-			cx:toast("error", "No devcontainer config found — open a file or folder of the project in the editor once", focused_cwd(cx) or "")
+			cx:toast("error", "No devcontainer config found — open a file of the project in the editor once, or cd into it", focused_cwd(cx) or "")
 			return
 		end
 		Resolve.detect_engine(function(engine)
@@ -439,6 +442,12 @@ tern.route.open(function(req, _cx)
 	end
 	tern.kv.set("ctx", { dir = dir, host = req.host })
 	return nil
+end)
+
+tern.on("cwd", function(ev, _cx)
+	if ev.path ~= nil and ev.path ~= "" then
+		tern.kv.set("ctx", { dir = ev.path, host = "" })
+	end
 end)
 
 tern.on("window_start", function(_cx)
