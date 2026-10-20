@@ -157,6 +157,16 @@ function Bridge.provision(cx: any, ws: string, container: string, engine: string
 	end)
 end
 
+local function remote_pane(cx: any): number?
+	for _, pane in cx.session:panes() do
+		local cwd = pane.cwd
+		if cwd ~= nil and cwd ~= "" and not tern.fs.exists(cwd) then
+			return pane.pane
+		end
+	end
+	return nil
+end
+
 post_rebuild = function(cx: any, ws: string)
 	if not Bridge.alias_exists(ws) then
 		cx:toast("info", "Container rebuilt — run 'Attach Tern to Container' for native reconnection", ws)
@@ -173,7 +183,12 @@ post_rebuild = function(cx: any, ws: string)
 			Bridge.provision(cx, ws, container, engine, function(ok)
 				if ok then
 					cx:toast("success", "Bridge ready — Tern is reconnecting to the container", container)
-					cx:command("new_session_on_host")
+					local host_pane = remote_pane(cx)
+					if host_pane ~= nil then
+						cx.layout:split(host_pane, "right")
+					else
+						cx:command("new_session_on_host")
+					end
 				end
 			end)
 		end)
