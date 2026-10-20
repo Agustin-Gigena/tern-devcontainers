@@ -40,7 +40,14 @@ reinstalls it.
 
 Note: Microsoft officially supports docker; podman works via the
 docker-compatible CLI and is supported by this plugin, not by Microsoft.
-Workspace folder names containing spaces produce ssh aliases whose names
-must be quoted manually in `~/.ssh/config`. `authorized_keys` is written
-for the container's default user; if your `remoteUser` differs, add the
-key manually.
+
+For fully automatic reopen after a rebuild (no picker), persist the
+container daemon's state with two named volumes in your compose file:
+`tern-state:/home/vscode/.local/state/tern` and
+`tern-config:/home/vscode/.config/tern`. The fresh daemon restores its
+saved session and the plugin reopens a pane inside without asking.
+
+Two caveats: workspace folder names containing spaces produce ssh aliases
+whose names must be quoted manually in `~/.ssh/config`; and
+`authorized_keys` is written for the container's default user — if your
+`remoteUser` differs, add the key manually.
