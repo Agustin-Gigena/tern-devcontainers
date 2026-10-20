@@ -288,15 +288,25 @@ local function rebuild_dentro(cx: any, no_cache: boolean)
 	end)
 end
 
-local function rebuild_fuera(cx: any, no_cache: boolean)
+local function resolve_ws(cx: any): string?
 	local cwd = focused_cwd(cx)
-	if cwd == nil then
-		cx:toast("error", "No focused pane with a working directory")
-		return
+	if cwd ~= nil then
+		local ws = Resolve.find_config(cwd)
+		if ws ~= nil then
+			return ws
+		end
 	end
-	local ws = Resolve.find_config(cwd)
+	local ctx = tern.kv.get("ctx")
+	if type(ctx) == "table" and type(ctx.dir) == "string" then
+		return Resolve.find_config(ctx.dir)
+	end
+	return nil
+end
+
+local function rebuild_fuera(cx: any, no_cache: boolean)
+	local ws = resolve_ws(cx)
 	if ws == nil then
-		cx:toast("error", "No devcontainer config found in parent directories", cwd)
+		cx:toast("error", "No devcontainer config found — open a file or folder of the project in the editor once", focused_cwd(cx) or "")
 		return
 	end
 	start_rebuild(cx, ws, no_cache)
@@ -363,13 +373,9 @@ tern.command({
 	group = "Dev Containers",
 	available = outside_gate,
 	run = function(cx)
-		local cwd = focused_cwd(cx)
-		if cwd == nil then
-			return
-		end
-		local ws = Resolve.find_config(cwd)
+		local ws = resolve_ws(cx)
 		if ws == nil then
-			cx:toast("error", "No devcontainer config found in parent directories", cwd)
+			cx:toast("error", "No devcontainer config found — open a file or folder of the project in the editor once", focused_cwd(cx) or "")
 			return
 		end
 		Resolve.detect_engine(function(engine)
@@ -400,13 +406,9 @@ tern.command({
 	group = "Dev Containers",
 	available = outside_gate,
 	run = function(cx)
-		local cwd = focused_cwd(cx)
-		if cwd == nil then
-			return
-		end
-		local ws = Resolve.find_config(cwd)
+		local ws = resolve_ws(cx)
 		if ws == nil then
-			cx:toast("error", "No devcontainer config found in parent directories", cwd)
+			cx:toast("error", "No devcontainer config found — open a file or folder of the project in the editor once", focused_cwd(cx) or "")
 			return
 		end
 		Resolve.detect_engine(function(engine)
@@ -428,6 +430,16 @@ tern.command({
 		end)
 	end,
 })
+
+tern.route.open(function(req, _cx)
+	local dir = req.path
+	local ok = pcall(tern.fs.list, dir)
+	if not ok then
+		dir = string.match(dir, "^(.*)/[^/]+$") or dir
+	end
+	tern.kv.set("ctx", { dir = dir, host = req.host })
+	return nil
+end)
 
 tern.on("window_start", function(_cx)
 	pcall(function()
