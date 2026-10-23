@@ -138,24 +138,30 @@ function Resolve.container_for_host(engine: Engine, host_path: string, callback:
 	end)
 end
 
-function Resolve.read_remote_user(config_dir: string): string?
+function Resolve.read_config(config_dir: string): { remoteUser: string?, workspaceFolder: string? }
+	local out: { remoteUser: string?, workspaceFolder: string? } = {}
 	for _, name in { "/.devcontainer/devcontainer.json", "/.devcontainer.json" } do
 		local path = config_dir .. name
 		if tern.fs.exists(path) then
 			local ok, text = pcall(tern.fs.read, path)
 			if not ok then
-				return nil
+				return out
 			end
 			local stripped = string.gsub(text, "/%*.-%*/", "")
 			stripped = string.gsub(stripped, "//[^\n]*", "")
 			local ok2, doc = pcall(tern.json.decode, stripped)
-			if ok2 and type(doc) == "table" and type(doc.remoteUser) == "string" then
-				return doc.remoteUser
+			if ok2 and type(doc) == "table" then
+				if type(doc.remoteUser) == "string" then
+					out.remoteUser = doc.remoteUser
+				end
+				if type(doc.workspaceFolder) == "string" then
+					out.workspaceFolder = doc.workspaceFolder
+				end
 			end
-			return nil
+			return out
 		end
 	end
-	return nil
+	return out
 end
 
 return Resolve

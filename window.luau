@@ -133,10 +133,14 @@ local function read_or_create_keypair(cb: (boolean) -> ())
 	end)
 end
 
-local function ensure_sshd(engine: string, container: string, cb: (boolean) -> ())
-	local script = "which sshd >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq openssh-server); mkdir -p /run/sshd"
+local function ensure_sshd(engine: string, container: string, cb: (string?) -> ())
+	local script = "which sshd >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq openssh-server); mkdir -p /run/sshd; ssh-keygen -A >/dev/null 2>&1; ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub"
 	tern.process.run({ engine, "exec", "--user", "root", container, "sh", "-c", script }, {}, function(r)
-		cb(r.status == 0)
+		if r.status ~= 0 then
+			cb(nil)
+			return
+		end
+		cb(string.match(r.stdout, "SHA256:%S+"))
 	end)
 end
 
@@ -177,7 +181,7 @@ local function resolve_user(ws: string, cb: (string?) -> ())
 			end
 		end
 		if user == nil then
-			user = Resolve.read_remote_user(ws)
+			user = Resolve.read_config(ws).remoteUser
 		end
 		cb(user)
 	end)
@@ -249,12 +253,13 @@ function Bridge.provision(cx: any, ws: string, engine: string, cb: (boolean) -> 
 				cb(false)
 				return
 			end
-			ensure_sshd(engine, container, function(ok2)
-				if not ok2 then
+			ensure_sshd(engine, container, function(fp)
+				if fp == nil then
 					cx:toast("error", "Could not install openssh-server in the container (Debian/Ubuntu images only) — install it manually")
 					cb(false)
 					return
 				end
+				tern.kv.set("fp:" .. Bridge.alias_name(ws), fp)
 				resolve_user(ws, function(user)
 					ensure_authorized_keys(engine, container, user, function(ok3)
 						if not ok3 then
@@ -275,14 +280,65 @@ function Bridge.provision(cx: any, ws: string, engine: string, cb: (boolean) -> 
 	end)
 end
 
-local function remote_pane(cx: any): number?
-	for _, pane in cx.session:panes() do
-		local cwd = pane.cwd
-		if cwd ~= nil and cwd ~= "" and not tern.fs.exists(cwd) then
-			return pane.pane
+-- Container workspaceFolder: the CLI resolves defaults and substitution;
+-- the raw devcontainer.json is the fallback.
+local function resolve_workspace_folder(ws: string, cb: (string?) -> ())
+	tern.process.run({ "devcontainer", "read-configuration", "--workspace-folder", ws }, {}, function(r)
+		local folder: string? = nil
+		if r.status == 0 then
+			local ok, doc = pcall(tern.json.decode, r.stdout)
+			local c = if ok and type(doc) == "table" then doc.configuration else nil
+			if type(c) == "table" and type(c.workspaceFolder) == "string" and c.workspaceFolder ~= "" then
+				folder = c.workspaceFolder
+			end
 		end
+		if folder == nil then
+			folder = Resolve.read_config(ws).workspaceFolder
+		end
+		cb(folder)
+	end)
+end
+
+-- Attach the managed host and open a shell INSIDE the container, focused.
+-- No dialogs, no pickers: hosts:add waits for the (re)connection — that is
+-- the rebuild-reconnect barrier — and a pinned host-key fingerprint is
+-- trusted automatically (the transport is the local docker socket).
+local function connect_and_open(cx: any, alias: string, ws: string)
+	local function open_shell(cx2: any)
+		resolve_workspace_folder(ws, function(folder)
+			local opts: { cwd: string }? = nil
+			if folder ~= nil and folder ~= "" then
+				opts = { cwd = folder }
+			end
+			cx2.hosts:terminal(alias, opts):next(function(_pane, err, cx3)
+				if err ~= nil then
+					cx3:toast("error", "Host conectado pero no pude abrir el shell", tostring(err))
+				end
+			end)
+		end)
 	end
-	return nil
+
+	local pinned = tern.kv.get("fp:" .. alias)
+	cx.hosts:add(alias):next(function(host, err, cx2)
+		if err == nil and host ~= nil then
+			open_shell(cx2)
+			return
+		end
+		if pinned == nil or type(pinned) ~= "string" then
+			cx2:toast("info", "Confirmá la verificación del host en el diálogo", alias)
+			cx2:command("add_remote_host")
+			return
+		end
+		cx2.hosts:trust(alias, pinned)
+		cx2.hosts:add(alias):next(function(_host, err2, cx3)
+			if err2 == nil then
+				open_shell(cx3)
+			else
+				cx3:toast("info", "Confirmá la verificación del host en el diálogo", alias)
+				cx3:command("add_remote_host")
+			end
+		end)
+	end)
 end
 
 -- Attach to a devcontainer that lives on an SSH-host machine: the
@@ -385,13 +441,8 @@ post_rebuild = function(cx: any, ws: string)
 		end
 		Bridge.provision(cx, ws, engine, function(ok)
 			if ok then
-				cx:toast("success", "Bridge ready — Tern is reconnecting to the container")
-				local host_pane = remote_pane(cx)
-				if host_pane ~= nil then
-					cx.layout:split(host_pane, "right")
-				else
-					cx:command("new_session_on_host")
-				end
+				cx:toast("success", "Rebuilt — reconectando al container", ws)
+				connect_and_open(cx, Bridge.alias_name(ws), ws)
 			end
 		end)
 	end)
@@ -530,16 +581,20 @@ local function rebuild_dentro(cx: any, no_cache: boolean)
 end
 
 local function resolve_ws(cx: any): string?
-	local cwd = focused_cwd(cx)
-	if cwd ~= nil then
-		local ws = Resolve.find_config(cwd)
+	local pinned = tern.kv.get("pinned_ws")
+	if type(pinned) == "string" and Resolve.find_config(pinned) ~= nil then
+		return pinned
+	end
+	local ctx = tern.kv.get("ctx")
+	if type(ctx) == "table" and type(ctx.dir) == "string" then
+		local ws = Resolve.find_config(ctx.dir)
 		if ws ~= nil then
 			return ws
 		end
 	end
-	local ctx = tern.kv.get("ctx")
-	if type(ctx) == "table" and type(ctx.dir) == "string" then
-		return Resolve.find_config(ctx.dir)
+	local cwd = focused_cwd(cx)
+	if cwd ~= nil then
+		return Resolve.find_config(cwd)
 	end
 	return nil
 end
@@ -639,8 +694,7 @@ tern.command({
 			end
 			Bridge.provision(cx, ws, engine, function(ok)
 				if ok then
-					cx:toast("success", "Bridge ready — confirm the dialog to install Tern in the container", Bridge.alias_name(ws))
-					cx:command("add_remote_host")
+					connect_and_open(cx, Bridge.alias_name(ws), ws)
 				end
 			end)
 		end)
@@ -679,7 +733,7 @@ tern.command({
 			end
 			Bridge.provision(cx, ws, engine, function(ok)
 				if ok then
-					cx:command("switch_host")
+					connect_and_open(cx, Bridge.alias_name(ws), ws)
 				end
 			end)
 		end)
@@ -696,11 +750,26 @@ tern.route.open(function(req, _cx)
 	return nil
 end)
 
-tern.on("cwd", function(ev, _cx)
-	if ev.path ~= nil and ev.path ~= "" then
-		tern.kv.set("ctx", { dir = ev.path, host = "" })
-	end
-end)
+tern.command({
+	id = "pin_project",
+	title = "Pin Project Folder",
+	icon = "file",
+	group = "Dev Containers",
+	available = outside_gate,
+	run = function(cx)
+		local cwd = focused_cwd(cx)
+		if cwd == nil then
+			return
+		end
+		local ws = Resolve.find_config(cwd)
+		if ws == nil then
+			cx:toast("error", "No devcontainer config found in parent directories", cwd)
+			return
+		end
+		tern.kv.set("pinned_ws", ws)
+		cx:toast("success", "Pinned — rebuild/attach usan siempre esta carpeta", ws)
+	end,
+})
 
 tern.on("window_start", function(_cx)
 	pcall(function()
