@@ -30,21 +30,21 @@ end
 
 export type Engine = "docker" | "podman"
 
-local function probe(engine: Engine, callback: (Engine?) -> ())
+local function probe(engine: Engine, callback: (Engine?, any) -> ())
 	local ok = pcall(function()
-		tern.process.run({ engine, "ps", "-q" }, {}, function(result)
-			callback(if result.status == 0 then engine else nil)
+		tern.process.run({ engine, "ps", "-q" }, {}, function(result, cx)
+			callback(if result.status == 0 then engine else nil, cx)
 		end)
 	end)
 	if not ok then
-		callback(nil)
+		callback(nil, nil)
 	end
 end
 
-function Resolve.detect_engine(callback: (Engine?) -> ())
-	probe("docker", function(engine)
+function Resolve.detect_engine(callback: (Engine?, any) -> ())
+	probe("docker", function(engine, cx)
 		if engine ~= nil then
-			callback(engine)
+			callback(engine, cx)
 		else
 			probe("podman", callback)
 		end
@@ -57,9 +57,9 @@ local function name_of(c: any): string
 end
 
 local function inspect_all(engine: Engine, callback: (any?) -> ())
-	tern.process.run({ engine, "ps", "-q" }, {}, function(result)
+	tern.process.run({ engine, "ps", "-q" }, {}, function(result, cx)
 		if result.status ~= 0 then
-			callback(nil)
+			callback(nil, cx)
 			return
 		end
 		local argv = { engine, "inspect" }
@@ -67,20 +67,20 @@ local function inspect_all(engine: Engine, callback: (any?) -> ())
 			table.insert(argv, id)
 		end
 		if #argv == 2 then
-			callback(nil)
+			callback(nil, cx)
 			return
 		end
-		tern.process.run(argv, {}, function(r2)
+		tern.process.run(argv, {}, function(r2, cx)
 			if r2.status ~= 0 then
-				callback(nil)
+				callback(nil, cx)
 				return
 			end
 			local ok, containers = pcall(tern.json.decode, r2.stdout)
 			if not ok then
-				callback(nil)
+				callback(nil, cx)
 				return
 			end
-			callback(containers)
+			callback(containers, cx)
 		end)
 	end)
 end
@@ -96,9 +96,9 @@ end
 function Resolve.container_info(
 	engine: Engine,
 	container_cwd: string,
-	callback: ({ ws: string, container: string }?) -> ()
+	callback: ({ ws: string, container: string }?, any) -> ()
 )
-	inspect_all(engine, function(containers)
+	inspect_all(engine, function(containers, cx)
 		local best: { ws: string, container: string }? = nil
 		local best_len = -1
 		for _, c in (containers or {}) do
@@ -115,12 +115,12 @@ function Resolve.container_info(
 				end
 			end
 		end
-		callback(best)
+		callback(best, cx)
 	end)
 end
 
-function Resolve.container_for_host(engine: Engine, host_path: string, callback: (string?) -> ())
-	inspect_all(engine, function(containers)
+function Resolve.container_for_host(engine: Engine, host_path: string, callback: (string?, any) -> ())
+	inspect_all(engine, function(containers, cx)
 		local best_name: string? = nil
 		local best_len = -1
 		for _, c in (containers or {}) do
@@ -134,7 +134,7 @@ function Resolve.container_for_host(engine: Engine, host_path: string, callback:
 				end
 			end
 		end
-		callback(best_name)
+		callback(best_name, cx)
 	end)
 end
 

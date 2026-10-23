@@ -122,32 +122,32 @@ function Bridge.write_remote_alias(ws: string, user: string?, upstream: string):
 	return okw
 end
 
-local function read_or_create_keypair(cb: (boolean) -> ())
+local function read_or_create_keypair(fallback: any, cb: (boolean, any) -> ())
 	local priv = tern.plugin.data .. "/" .. BRIDGE_KEY
 	if tern.fs.exists(priv) then
-		cb(true)
+		cb(true, fallback)
 		return
 	end
-	tern.process.run({ "ssh-keygen", "-t", "ed25519", "-N", "", "-q", "-f", priv }, {}, function(r)
-		cb(r.status == 0)
+	tern.process.run({ "ssh-keygen", "-t", "ed25519", "-N", "", "-q", "-f", priv }, {}, function(r, cx)
+		cb(r.status == 0, cx or fallback)
 	end)
 end
 
-local function ensure_sshd(engine: string, container: string, cb: (string?) -> ())
+local function ensure_sshd(engine: string, container: string, cb: (string?, any) -> ())
 	local script = "which sshd >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq openssh-server); mkdir -p /run/sshd; ssh-keygen -A >/dev/null 2>&1; ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub"
-	tern.process.run({ engine, "exec", "--user", "root", container, "sh", "-c", script }, {}, function(r)
+	tern.process.run({ engine, "exec", "--user", "root", container, "sh", "-c", script }, {}, function(r, cx)
 		if r.status ~= 0 then
-			cb(nil)
+			cb(nil, cx)
 			return
 		end
-		cb(string.match(r.stdout, "SHA256:%S+"))
+		cb(string.match(r.stdout, "SHA256:%S+"), cx)
 	end)
 end
 
-local function ensure_authorized_keys(engine: string, container: string, user: string?, cb: (boolean) -> ())
+local function ensure_authorized_keys(engine: string, container: string, user: string?, cb: (boolean, any) -> ())
 	local ok, pub = pcall(tern.fs.read, tern.plugin.data .. "/" .. BRIDGE_KEY .. ".pub")
 	if not ok then
-		cb(false)
+		cb(false, nil)
 		return
 	end
 	pub = string.gsub(pub, "%s+$", "")
@@ -163,15 +163,15 @@ local function ensure_authorized_keys(engine: string, container: string, user: s
 	else
 		argv = { engine, "exec", container, "sh", "-c", script }
 	end
-	tern.process.run(argv, {}, function(r)
-		cb(r.status == 0)
+	tern.process.run(argv, {}, function(r, cx)
+		cb(r.status == 0, cx)
 	end)
 end
 
 -- remoteUser the way the CLI resolves it (image defaults included);
 -- the raw devcontainer.json often lacks it.
-local function resolve_user(ws: string, cb: (string?) -> ())
-	tern.process.run({ "devcontainer", "read-configuration", "--workspace-folder", ws }, {}, function(r)
+local function resolve_user(ws: string, cb: (string?, any) -> ())
+	tern.process.run({ "devcontainer", "read-configuration", "--workspace-folder", ws }, {}, function(r, cx)
 		local user: string? = nil
 		if r.status == 0 then
 			local ok, doc = pcall(tern.json.decode, r.stdout)
@@ -183,7 +183,7 @@ local function resolve_user(ws: string, cb: (string?) -> ())
 		if user == nil then
 			user = Resolve.read_config(ws).remoteUser
 		end
-		cb(user)
+		cb(user, cx)
 	end)
 end
 
@@ -240,39 +240,49 @@ function Bridge.write_alias(ws: string, user: string?, engine: string): boolean
 	return okw
 end
 
-function Bridge.provision(cx: any, ws: string, engine: string, cb: (boolean) -> ())
-	read_or_create_keypair(function(ok1)
+function Bridge.provision(fallback: any, ws: string, engine: string, cb: (boolean, any) -> ())
+	read_or_create_keypair(fallback, function(ok1, cx)
 		if not ok1 then
-			cx:toast("error", "ssh-keygen is missing or failed")
-			cb(false)
+			if cx then
+				cx:toast("error", "ssh-keygen is missing or failed")
+			end
+			cb(false, cx)
 			return
 		end
-		Resolve.container_for_host(engine, ws, function(container)
+		Resolve.container_for_host(engine, ws, function(container, cx)
 			if container == nil then
-				cx:toast("error", "No running container is bind-mounting this workspace", ws)
-				cb(false)
+				if cx then
+					cx:toast("error", "No running container is bind-mounting this workspace", ws)
+				end
+				cb(false, cx)
 				return
 			end
-			ensure_sshd(engine, container, function(fp)
+			ensure_sshd(engine, container, function(fp, cx)
 				if fp == nil then
-					cx:toast("error", "Could not install openssh-server in the container (Debian/Ubuntu images only) — install it manually")
-					cb(false)
+					if cx then
+						cx:toast("error", "Could not install openssh-server in the container (Debian/Ubuntu images only) — install it manually")
+					end
+					cb(false, cx)
 					return
 				end
 				tern.kv.set("fp:" .. Bridge.alias_name(ws), fp)
-				resolve_user(ws, function(user)
-					ensure_authorized_keys(engine, container, user, function(ok3)
+				resolve_user(ws, function(user, cx)
+					ensure_authorized_keys(engine, container, user, function(ok3, cx)
 						if not ok3 then
-							cx:toast("error", "Could not write authorized_keys in the container")
-							cb(false)
+							if cx then
+								cx:toast("error", "Could not write authorized_keys in the container")
+							end
+							cb(false, cx)
 							return
 						end
 						if not Bridge.write_alias(ws, user, engine) then
-							cx:toast("error", "Could not write the SSH config alias")
-							cb(false)
+							if cx then
+								cx:toast("error", "Could not write the SSH config alias")
+							end
+							cb(false, cx)
 							return
 						end
-						cb(true)
+						cb(true, cx)
 					end)
 				end)
 			end)
@@ -282,8 +292,8 @@ end
 
 -- Container workspaceFolder: the CLI resolves defaults and substitution;
 -- the raw devcontainer.json is the fallback.
-local function resolve_workspace_folder(ws: string, cb: (string?) -> ())
-	tern.process.run({ "devcontainer", "read-configuration", "--workspace-folder", ws }, {}, function(r)
+local function resolve_workspace_folder(ws: string, cb: (string?, any) -> ())
+	tern.process.run({ "devcontainer", "read-configuration", "--workspace-folder", ws }, {}, function(r, cx)
 		local folder: string? = nil
 		if r.status == 0 then
 			local ok, doc = pcall(tern.json.decode, r.stdout)
@@ -295,7 +305,7 @@ local function resolve_workspace_folder(ws: string, cb: (string?) -> ())
 		if folder == nil then
 			folder = Resolve.read_config(ws).workspaceFolder
 		end
-		cb(folder)
+		cb(folder, cx)
 	end)
 end
 
@@ -305,14 +315,14 @@ end
 -- trusted automatically (the transport is the local docker socket).
 local function connect_and_open(cx: any, alias: string, ws: string)
 	local function open_shell(cx2: any)
-		resolve_workspace_folder(ws, function(folder)
+		resolve_workspace_folder(ws, function(folder, cx3)
 			local opts: { cwd: string }? = nil
 			if folder ~= nil and folder ~= "" then
 				opts = { cwd = folder }
 			end
-			cx2.hosts:terminal(alias, opts):next(function(_pane, err, cx3)
+			cx3.hosts:terminal(alias, opts):next(function(_pane, err, cx4)
 				if err ~= nil then
-					cx3:toast("error", "Host conectado pero no pude abrir el shell", tostring(err))
+					cx4:toast("error", "Host conectado pero no pude abrir el shell", tostring(err))
 				end
 			end)
 		end)
@@ -360,14 +370,18 @@ local function remote_attach(cx: any, pane: number, cwd: string)
 		cx:toast("error", "Agregá el Host de la máquina remota a ~/.ssh/config (una entrada Host propia, sin wildcards) y volvé a correr Attach")
 		return
 	end
-	read_or_create_keypair(function(ok)
+	read_or_create_keypair(cx, function(ok, cx)
 		if not ok then
-			cx:toast("error", "ssh-keygen is missing or failed")
+			if cx then
+				cx:toast("error", "ssh-keygen is missing or failed")
+			end
 			return
 		end
 		local okp, pub = pcall(tern.fs.read, tern.plugin.data .. "/" .. BRIDGE_KEY .. ".pub")
 		if not okp then
-			cx:toast("error", "Could not read the plugin keypair")
+			if cx then
+				cx:toast("error", "Could not read the plugin keypair")
+			end
 			return
 		end
 		pub = string.gsub(pub, "%s+$", "")
@@ -384,44 +398,46 @@ local function remote_attach(cx: any, pane: number, cwd: string)
 			"command -v devcontainer >/dev/null 2>&1 || npm install -g @devcontainers/cli >/dev/null 2>&1",
 			"U=$(devcontainer read-configuration --workspace-folder \"$d\" 2>/dev/null | sed -n 's/.*\"remoteUser\": *\"\\([^\"]*\\)\".*/\\1/p' | head -1)",
 			'C=$(docker ps -q --filter label=devcontainer.local_folder="$d" | head -1)',
-			"docker exec --user root \"$C\" sh -c 'which sshd >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq openssh-server); mkdir -p /run/sshd'",
+			"docker exec --user root \"$C\" sh -c 'which sshd >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq openssh-server); mkdir -p /run/sshd; ssh-keygen -A >/dev/null 2>&1'",
 			"docker exec --user \"${U:-$(docker exec \"$C\" id -un)}\" \"$C\" sh -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && (grep -qxF "
 				.. q
 				.. " ~/.ssh/authorized_keys || echo "
 				.. q
 				.. " >> ~/.ssh/authorized_keys)'",
-			'printf %s "$U" > /tmp/tern-dc-user',
-			'printf %s "$d" > /tmp/tern-dc-ws',
+			'printf \'%s\\n%s\\n%s\\n\' "${U:-}" "$d" "$(docker exec --user root "$C" ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null | grep -o \'SHA256:[^ ]*\')" > /tmp/tern-dc-meta',
 			"touch /tmp/tern-dc-attach.done",
 		}, "; ")
 		cx:run(pane, "sh -c " .. Resolve.shell_quote(script) .. "\r")
 		cx:toast("info", "Provisionando el container en la máquina remota…", upstream)
 		local tries = 0
-		local function check()
+		local function check(ccx: any)
 			tries = tries + 1
 			tern.process.run(
-				{ "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", upstream, "test -f /tmp/tern-dc-attach.done" },
+				{ "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", upstream, "cat /tmp/tern-dc-meta 2>/dev/null" },
 				{},
-				function(r)
-					if r.status == 0 then
-						tern.process.run(
-							{ "ssh", "-o", "BatchMode=yes", upstream, "cat /tmp/tern-dc-user /tmp/tern-dc-ws" },
-							{},
-							function(r2)
-								local u = string.match(r2.stdout, "([^\n]+)")
-								local w = string.match(r2.stdout, "\n([^\n]+)$")
-								if Bridge.write_remote_alias(w or cwd, u, upstream) then
-									cx:toast("success", "Container remoto listo — confirmá el diálogo para instalar Tern", upstream)
-									cx:command("add_remote_host")
-								else
-									cx:toast("error", "Could not write the SSH config alias")
-								end
+				function(r, rcx)
+					local live = if rcx ~= nil then rcx else ccx
+					local u, w, fp = string.match(r.stdout, "^(.-)\n(.-)\n(SHA256:%S+)")
+					if u ~= nil then
+						local alias = "tern-" .. upstream .. "-" .. (string.match(w, "[^/]+$") or "dev")
+						if fp ~= nil then
+							tern.kv.set("fp:" .. alias, fp)
+						end
+						if Bridge.write_remote_alias(w, u, upstream) then
+							if live then
+								connect_and_open(live, alias, w)
 							end
-						)
+						else
+							if live then
+								live:toast("error", "Could not write the SSH config alias")
+							end
+						end
 					elseif tries < 30 then
 						tern.timer(2000, check)
 					else
-						cx:toast("error", "No pude verificar por ssh (" .. upstream .. ") — necesitás key autorizada en esa máquina; mirá el pane remoto")
+						if live then
+							live:toast("error", "No pude verificar por ssh (" .. upstream .. ") — necesitás key autorizada en esa máquina; mirá el pane remoto")
+						end
 					end
 				end
 			)
@@ -435,14 +451,14 @@ post_rebuild = function(cx: any, ws: string)
 		cx:toast("info", "Container rebuilt — run 'Attach Tern to Container' for native reconnection", ws)
 		return
 	end
-	Resolve.detect_engine(function(engine)
+	Resolve.detect_engine(function(engine, ecx)
 		if engine == nil then
 			return
 		end
-		Bridge.provision(cx, ws, engine, function(ok)
-			if ok then
-				cx:toast("success", "Rebuilt — reconectando al container", ws)
-				connect_and_open(cx, Bridge.alias_name(ws), ws)
+		Bridge.provision(ecx, ws, engine, function(ok, pcx)
+			if ok and pcx then
+				pcx:toast("success", "Rebuilt — reconectando al container", ws)
+				connect_and_open(pcx, Bridge.alias_name(ws), ws)
 			end
 		end)
 	end)
@@ -563,19 +579,21 @@ local function rebuild_dentro(cx: any, no_cache: boolean)
 		return
 	end
 	local pane = focused_pane_id(cx)
-	Resolve.detect_engine(function(engine)
+	Resolve.detect_engine(function(engine, ecx)
 		if engine == nil then
-			cx:toast("error", "Neither docker nor podman is available")
+			if ecx then
+				ecx:toast("error", "Neither docker nor podman is available")
+			end
 			return
 		end
-		Resolve.container_info(engine, cwd, function(info)
+		Resolve.container_info(engine, cwd, function(info, icx)
 			if info == nil then
 				-- Not a local container: the pane lives on another machine
 				-- (SSH host). Run the rebuild inside that pane's shell.
-				remote_rebuild(cx, pane, no_cache)
+				remote_rebuild(if icx ~= nil then icx else cx, pane, no_cache)
 				return
 			end
-			start_rebuild(cx, info.ws, no_cache)
+			start_rebuild(if icx ~= nil then icx else cx, info.ws, no_cache)
 		end)
 	end)
 end
@@ -687,14 +705,16 @@ tern.command({
 			cx:toast("error", "No devcontainer config found — open a file of the project in the editor once, or cd into it", focused_cwd(cx) or "")
 			return
 		end
-		Resolve.detect_engine(function(engine)
+		Resolve.detect_engine(function(engine, ecx)
 			if engine == nil then
-				cx:toast("error", "Neither docker nor podman is available")
+				if ecx then
+					ecx:toast("error", "Neither docker nor podman is available")
+				end
 				return
 			end
-			Bridge.provision(cx, ws, engine, function(ok)
-				if ok then
-					connect_and_open(cx, Bridge.alias_name(ws), ws)
+			Bridge.provision(cx, ws, engine, function(ok, pcx)
+				if ok and pcx then
+					connect_and_open(pcx, Bridge.alias_name(ws), ws)
 				end
 			end)
 		end)
@@ -726,14 +746,16 @@ tern.command({
 			cx:toast("error", "No devcontainer config found — open a file of the project in the editor once, or cd into it", focused_cwd(cx) or "")
 			return
 		end
-		Resolve.detect_engine(function(engine)
+		Resolve.detect_engine(function(engine, ecx)
 			if engine == nil then
-				cx:toast("error", "Neither docker nor podman is available")
+				if ecx then
+					ecx:toast("error", "Neither docker nor podman is available")
+				end
 				return
 			end
-			Bridge.provision(cx, ws, engine, function(ok)
-				if ok then
-					connect_and_open(cx, Bridge.alias_name(ws), ws)
+			Bridge.provision(cx, ws, engine, function(ok, pcx)
+				if ok and pcx then
+					connect_and_open(pcx, Bridge.alias_name(ws), ws)
 				end
 			end)
 		end)
